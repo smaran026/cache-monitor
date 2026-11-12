@@ -11,6 +11,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[cache-monitor]${NC} $*"; }
@@ -41,8 +42,8 @@ install_pi() {
   mkdir -p "$dest"
 
   if [[ -f "$dest/cache-monitor.ts" ]]; then
-    warn "Existing cache-monitor.ts found at $dest — backing up to cache-monitor.ts.bak"
-    cp "$dest/cache-monitor.ts" "$dest/cache-monitor.ts.bak"
+    warn "Existing cache-monitor.ts found at $dest — backing up to cache-monitor.ts.$STAMP.bak"
+    cp "$dest/cache-monitor.ts" "$dest/cache-monitor.ts.$STAMP.bak"
   fi
 
   cp "$REPO_DIR/pi/cache-monitor.ts" "$dest/cache-monitor.ts"
@@ -60,7 +61,7 @@ install_opencode() {
   if [[ -f "$dest/index.ts" ]]; then
     warn "Existing OpenCode plugin found at $dest — backing up"
     for f in index.ts tui.tsx package.json; do
-      [[ -f "$dest/$f" ]] && cp "$dest/$f" "$dest/$f.bak"
+      [[ -f "$dest/$f" ]] && cp "$dest/$f" "$dest/$f.$STAMP.bak"
     done
   fi
 
@@ -69,17 +70,19 @@ install_opencode() {
   cp "$REPO_DIR/opencode/package.json" "$dest/package.json"
   success "OpenCode plugin installed: $dest"
 
-  # Ensure the plugin is registered in opencode config
-  local cfg="$HOME/.config/opencode/config.json"
-  if [[ -f "$cfg" ]]; then
-    if grep -q "oc-mistral-affinity" "$cfg" 2>/dev/null; then
-      info "Plugin already registered in $cfg"
+  # The plugin has two halves registered in two files:
+  #   opencode.json  "plugin":  [...]  -> index.ts (request hooks)
+  #   cli.json       "plugins": [...]  -> tui.tsx  (footer badge + /cache)
+  local cfg_dir="$HOME/.config/opencode"
+  local pair file label
+  for pair in "opencode.json:\"plugin\"" "cli.json:\"plugins\""; do
+    file="${pair%%:*}"; label="${pair#*:}"
+    if [[ -f "$cfg_dir/$file" ]] && grep -q "oc-mistral-affinity" "$cfg_dir/$file" 2>/dev/null; then
+      info "Plugin already registered in $cfg_dir/$file"
     else
-      warn "Plugin not found in $cfg — please add it manually (see README)."
+      warn "Add \"./local-plugins/oc-mistral-affinity\" to the $label array in $cfg_dir/$file (see README)."
     fi
-  else
-    warn "No opencode config.json found at $cfg — please register the plugin manually (see README)."
-  fi
+  done
 
   echo ""
   info "Restart OpenCode for changes to take effect."

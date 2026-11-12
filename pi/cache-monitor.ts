@@ -1,34 +1,151 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-const CONFIG_FILE = join(homedir(), ".pi/agent/cache-monitor-config.json");
+const AGENT_DIR = join(homedir(), ".pi/agent");
+const CONFIG_FILE = join(AGENT_DIR, "cache-monitor-config.json");
+const REQUEST_LOG_FILE = join(AGENT_DIR, "mistral-requests.log");
+const PREFIX_LOG_FILE = join(AGENT_DIR, "cache-prefix.log");
+const MAX_LOG_BYTES = 512 * 1024;
 const DEFAULT_P_MISS_PCT = 10;
 const DEFAULT_MISS_PCT = 50;
 
-function loadThresholds(): { pMissPct: number; missPct: number } {
+// ---------------------------------------------------------------------------
+// Provider rules (configurable)
+//
+// A rule is keyed by provider id (Pi's `model.provider`). Add or override rules
+// in the "providers" object of ~/.pi/agent/cache-monitor-config.json. Set a
+// built-in rule to null to disable it. Example:
+//   { "providers": { "my-gateway": { "urls": ["gw.example.com"],
+//       "headers": ["x-affinity"], "bodyCacheKey": "inject" },
+//       "opencode-go": null } }
+//
+// bodyCacheKey: "strip"  remove prompt_cache_key from headers and request body
+//               "inject" set prompt_cache_key = session id in the request body
+//               "keep"   leave it untouched (default)
+// ---------------------------------------------------------------------------
+type BodyKeyMode = "strip" | "inject" | "keep";
+
+interface ProviderRule {
+  ids?: string[]; // extra provider ids that use this rule
+  urls?: string[]; // substrings matched against the model base URL
+  apis?: string[]; // Pi `model.api` values
+  headers?: string[]; // header names set to the session id
+  bodyCacheKey?: BodyKeyMode;
+}
+
+const DEFAULT_PROVIDERS: Record<string, ProviderRule> = {
+  mistral: {
+    urls: ["mistral.ai", "codestral"],
+    apis: ["mistral-conversations"],
+    headers: ["x-affinity"],
+    bodyCacheKey: "strip",
+  },
+  "opencode-go": {
+    urls: ["opencode.ai"],
+    headers: ["x-affinity", "x-session-affinity", "session-id"],
+    bodyCacheKey: "inject",
+  },
+};
+
+function readConfigFile(): Record<string, any> {
   try {
-    const raw = readFileSync(CONFIG_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    const pMissPct =
-      typeof parsed?.pMissPct === "number" && Number.isFinite(parsed.pMissPct) && parsed.pMissPct >= 0 && parsed.pMissPct <= 100
-        ? parsed.pMissPct
-        : DEFAULT_P_MISS_PCT;
-    const missPct =
-      typeof parsed?.missPct === "number" && Number.isFinite(parsed.missPct) && parsed.missPct >= 0 && parsed.missPct <= 100
-        ? parsed.missPct
-        : DEFAULT_MISS_PCT;
-    return { pMissPct, missPct };
+    const parsed = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
-    return { pMissPct: DEFAULT_P_MISS_PCT, missPct: DEFAULT_MISS_PCT };
+    return {};
   }
+}
+
+function loadProviders(): Record<string, ProviderRule> {
+  const merged: Record<string, ProviderRule> = { ...DEFAULT_PROVIDERS };
+  const user = readConfigFile().providers;
+  if (user && typeof user === "object") {
+    for (const [id, rule] of Object.entries(user)) {
+      if (rule === null) delete merged[id];
+      else if (typeof rule === "object") merged[id] = rule as ProviderRule;
+    }
+  }
+  return merged;
+}
+
+function findRule(
+  providers: Record<string, ProviderRule>,
+  model: { provider?: string; api?: string; baseUrl?: string } | undefined
+): { id: string; rule: ProviderRule } | null {
+  const provider = model?.provider || "";
+  const api = model?.api || "";
+  const baseUrl = model?.baseUrl || "";
+  for (const [id, rule] of Object.entries(providers)) {
+    if (provider && (provider === id || rule.ids?.includes(provider))) return { id, rule };
+  }
+  for (const [id, rule] of Object.entries(providers)) {
+    if (api && rule.apis?.includes(api)) return { id, rule };
+    if (baseUrl && rule.urls?.some((u) => baseUrl.includes(u))) return { id, rule };
+  }
+  return null;
+}
+
+function appendRotating(file: string, line: string) {
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    try {
+      if (statSync(file).size > MAX_LOG_BYTES) renameSync(file, file + ".1");
+    } catch {}
+    appendFileSync(file, line);
+  } catch {}
+}
+
+// Headers that can carry credentials or session cookies; never written to logs.
+const SENSITIVE_HEADER = /^(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie)$/i;
+
+function redactHeaders(headers: Record<string, unknown> | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    out[k] = SENSITIVE_HEADER.test(k) ? "[REDACTED]" : v;
+  }
+  return out;
+}
+
+const DEBUG_HEADERS = !!(process.env.PI_DEBUG_AFFINITY || process.env.PI_DEBUG_MISTRAL);
+const DEBUG_PREFIX = !!process.env.PI_DEBUG_PREFIX;
+
+function logPrefixHashes(providerId: string, model: string, sessionId: string, payload: unknown) {
+  if (!DEBUG_PREFIX) return;
+  try {
+    const text = JSON.stringify(payload) ?? "";
+    const hashes: Record<string, string> = {};
+    for (const kb of [4, 32, 128]) {
+      const n = kb * 1024;
+      if (text.length >= n) hashes[`first_${kb}k`] = createHash("sha1").update(text.slice(0, n)).digest("hex").slice(0, 12);
+    }
+    appendRotating(
+      PREFIX_LOG_FILE,
+      JSON.stringify({ t: new Date().toISOString(), provider: providerId, model, sessionId, bytes: text.length, ...hashes }) + "\n"
+    );
+  } catch {}
+}
+
+function loadThresholds(): { pMissPct: number; missPct: number } {
+  const parsed = readConfigFile();
+  const pMissPct =
+    typeof parsed?.pMissPct === "number" && Number.isFinite(parsed.pMissPct) && parsed.pMissPct >= 0 && parsed.pMissPct <= 100
+      ? parsed.pMissPct
+      : DEFAULT_P_MISS_PCT;
+  const missPct =
+    typeof parsed?.missPct === "number" && Number.isFinite(parsed.missPct) && parsed.missPct >= 0 && parsed.missPct <= 100
+      ? parsed.missPct
+      : DEFAULT_MISS_PCT;
+  return { pMissPct, missPct };
 }
 
 function saveThresholds(pMissPct: number, missPct: number) {
   try {
     mkdirSync(dirname(CONFIG_FILE), { recursive: true });
-    writeFileSync(CONFIG_FILE, JSON.stringify({ pMissPct, missPct }, null, 2));
+    // Read-modify-write so the "providers" section is preserved.
+    writeFileSync(CONFIG_FILE, JSON.stringify({ ...readConfigFile(), pMissPct, missPct }, null, 2));
   } catch {}
 }
 
@@ -63,6 +180,8 @@ interface TurnRecord {
   writeTokens: number;
   cachedStr: string;
   cost: number;
+  /** Estimated extra spend vs. a full cache hit on this turn (0 for hits). */
+  overpay: number;
   ttfsMs?: number;
   totalMs?: number;
   ts?: number;
@@ -97,11 +216,12 @@ export default function (pi: ExtensionAPI) {
   let totalCached = 0;
   let totalOutput = 0;
   let totalCost = 0;
-  let missCost = 0;
-  let hitCost = 0;
+  let missCost = 0; // total cost of turns classified as Miss or P Miss
+  let overpay = 0; // estimated extra spend caused by uncached prefix tokens
   let writeCost = 0;
   let totalWriteTokens = 0;
-  let missCount = 0;
+  let fullMissCount = 0;
+  let partialMissCount = 0;
   let coldPrefillCount = 0;
   let warmPrefillCount = 0;
   let abortedCount = 0;
@@ -124,10 +244,11 @@ export default function (pi: ExtensionAPI) {
     totalOutput = 0;
     totalCost = 0;
     missCost = 0;
-    hitCost = 0;
+    overpay = 0;
     writeCost = 0;
     totalWriteTokens = 0;
-    missCount = 0;
+    fullMissCount = 0;
+    partialMissCount = 0;
     coldPrefillCount = 0;
     warmPrefillCount = 0;
     abortedCount = 0;
@@ -159,6 +280,8 @@ export default function (pi: ExtensionAPI) {
       const completeHitFloor = Math.max(0, Math.min(1, (100 - missPct) / 100));
 
       resetStats();
+      let prevTotalPrompt = 0;
+      let lastCacheReadRate = 0; // $ per cached token, learned from the last turn that had cached tokens
       for (const entry of entries) {
         if (entry?.type === "message" && entry.message?.role === "assistant") {
           const usage = entry.message.usage;
@@ -215,6 +338,19 @@ export default function (pi: ExtensionAPI) {
             let description = "";
             let cachedStr = "";
             let turnHitPct = 0;
+            let turnOverpay = 0;
+
+            // Overpay estimate: the prompt prefix we expected to be cached is the previous turn's prompt.
+            // Every expected-but-uncached token cost (input rate - cache-read rate) more than a hit.
+            const estimateOverpay = (): number => {
+              const expected = Math.min(prevTotalPrompt, totalPrompt);
+              const lost = Math.max(0, expected - cached);
+              if (lost === 0) return 0;
+              const inputRate = uncached > 0 && usage.cost?.input > 0 ? usage.cost.input / uncached : 0;
+              if (inputRate > 0) return lost * Math.max(0, inputRate - lastCacheReadRate);
+              return totalPrompt > 0 ? cost * (lost / totalPrompt) : 0; // no per-token rate available
+            };
+            if (cached > 0 && usage.cost?.cacheRead > 0) lastCacheReadRate = usage.cost.cacheRead / cached;
 
             if (isAborted) {
               abortedCount++;
@@ -235,7 +371,7 @@ export default function (pi: ExtensionAPI) {
                   coldPrefillCount++;
                   turnWriteTokens = explicitWrite > 0 ? explicitWrite : uncached;
                   totalWriteTokens += turnWriteTokens;
-                  writeCost += cost;
+                  writeCost += usage.cost?.cacheWrite || 0;
 
                   const sentK = Math.round(totalPrompt / 1000);
                   const writeK = Math.round(turnWriteTokens / 1000);
@@ -246,7 +382,6 @@ export default function (pi: ExtensionAPI) {
                   isHit = true;
                   isWarmPrefill = true;
                   warmPrefillCount++;
-                  hitCost += cost;
                   turnWriteTokens = explicitWrite > 0 ? explicitWrite : uncached;
                   totalWriteTokens += turnWriteTokens;
                   writeCost += (usage.cost?.cacheWrite || 0);
@@ -256,8 +391,10 @@ export default function (pi: ExtensionAPI) {
                   description = `Warm prefill hit: ${cached.toLocaleString()} cached tokens reused from prior session + ${uncached.toLocaleString()} new tokens sent (${turnHitPct.toFixed(1)}% cached)`;
                 }
               } else if (!isCompleteHit) {
-                missCount++;
+                fullMissCount++;
                 missCost += cost;
+                turnOverpay = estimateOverpay();
+                overpay += turnOverpay;
                 if (explicitWrite > 0) {
                   turnWriteTokens = explicitWrite;
                   totalWriteTokens += explicitWrite;
@@ -269,8 +406,10 @@ export default function (pi: ExtensionAPI) {
                 description = `${turnHitPct.toFixed(1)}% cached (${cached.toLocaleString()} / ${totalPrompt.toLocaleString()} tokens)`;
               } else if (!isStrictHit) {
                 isPartialMiss = true;
-                missCount++;
+                partialMissCount++;
                 missCost += cost;
+                turnOverpay = estimateOverpay();
+                overpay += turnOverpay;
                 if (explicitWrite > 0) {
                   turnWriteTokens = explicitWrite;
                   totalWriteTokens += explicitWrite;
@@ -282,7 +421,6 @@ export default function (pi: ExtensionAPI) {
                 description = `Partial miss: ${turnHitPct.toFixed(1)}% cached (${cached.toLocaleString()} / ${totalPrompt.toLocaleString()} tokens)`;
               } else {
                 isHit = true;
-                hitCost += cost;
                 if (explicitWrite > 0) {
                   turnWriteTokens = explicitWrite;
                   totalWriteTokens += explicitWrite;
@@ -310,6 +448,7 @@ export default function (pi: ExtensionAPI) {
               writeTokens: turnWriteTokens,
               cachedStr,
               cost,
+              overpay: turnOverpay,
               ttfsMs: turnTtfsMs,
               totalMs: turnTotalMs,
               ts: turnTs,
@@ -317,6 +456,7 @@ export default function (pi: ExtensionAPI) {
               label,
               description,
             });
+            if (!isAborted) prevTotalPrompt = totalPrompt;
           }
         }
       }
@@ -333,6 +473,8 @@ export default function (pi: ExtensionAPI) {
     const writeK = Math.round(totalWriteTokens / 1000);
     const writeStr = totalWriteTokens > 0 ? `${writeK}k write` : "";
     const lastTurn = history[history.length - 1];
+    const missCount = fullMissCount + partialMissCount;
+    const missBreakdown = `${fullMissCount} miss · ${partialMissCount} P`;
 
     // 1. Footer status bar with themed colors & telemetry
     try {
@@ -344,7 +486,7 @@ export default function (pi: ExtensionAPI) {
         const writeText = writeStr ? theme.fg("dim", ` · ${writeStr}`) : "";
         const missText =
           missCount > 0
-            ? theme.fg("error", ` (${missCount} miss · $${missCost.toFixed(4)} lost)`)
+            ? theme.fg("error", ` (${missBreakdown} · ~$${overpay.toFixed(4)} overpaid)`)
             : "";
         const lastTurnText = lastTurn
           ? theme.fg("dim", ` | ${lastTurn.label}`)
@@ -352,7 +494,7 @@ export default function (pi: ExtensionAPI) {
         statusMsg = `${icon}${rateText}${writeText}${missText}${lastTurnText}`;
       } else {
         const writeText = writeStr ? ` · ${writeStr}` : "";
-        const missText = missCount > 0 ? ` (${missCount} miss · $${missCost.toFixed(4)} lost)` : "";
+        const missText = missCount > 0 ? ` (${missBreakdown} · ~$${overpay.toFixed(4)} overpaid)` : "";
         statusMsg = `⚡ Cache: ${overallRate}%${writeText}${missText}${lastTurn ? " | " + lastTurn.label : ""}`;
       }
       ctx.ui.setStatus("cache_monitor", statusMsg);
@@ -373,8 +515,8 @@ export default function (pi: ExtensionAPI) {
         if (ttfsCount > 0) avgParts.push(`Avg ttfs: ${formatTtfs(ttfsSum / ttfsCount)}`);
         const avgLine = avgParts.length > 0 ? ` | ${avgParts.join(" · ")}` : "";
         const summary = [
-          `⚡ Prompt Cache: ${overallRate}% | Total Cost: $${totalCost.toFixed(4)} | Miss Cost: $${missCost.toFixed(4)} (${missPct}% of bill)${avgLine}`,
-          `   Cache Write: ${totalWriteTokens.toLocaleString()} tokens ($${writeCost.toFixed(4)}) | Hits: ${turnCount - missCount - abortedCount - coldPrefillCount} | Misses: ${missCount} | Prefill: ${prefillSummary}`,
+          `⚡ Prompt Cache: ${overallRate}% | Total Cost: $${totalCost.toFixed(4)} | Overpaid ~$${overpay.toFixed(4)} | Cost of miss turns: $${missCost.toFixed(4)} (${missPct}% of bill)${avgLine}`,
+          `   Cache Write: ${totalWriteTokens.toLocaleString()} tokens ($${writeCost.toFixed(4)}) | Hits: ${turnCount - missCount - abortedCount - coldPrefillCount} | Misses: ${fullMissCount} | P Misses: ${partialMissCount} | Prefill: ${prefillSummary}`,
           lastTurn ? `   Latest: ${lastTurn.label}` : "",
         ].filter(Boolean);
         ctx.ui.setWidget("cache_monitor_widget", summary, { placement: "belowEditor" });
@@ -406,7 +548,7 @@ export default function (pi: ExtensionAPI) {
         const missPct = totalCost > 0 ? ((missCost / totalCost) * 100).toFixed(1) : "0.0";
         const writeK = Math.round(totalWriteTokens / 1000);
         const writeTitle = totalWriteTokens > 0 ? ` | Write: ${writeK}k [$${writeCost.toFixed(4)}]` : "";
-        const title = `Prompt Cache (${overallRate}% | Total: $${totalCost.toFixed(4)}${writeTitle} | Miss Cost: $${missCost.toFixed(4)} [${missPct}%]${avgTitle} | Enter to inspect)`;
+        const title = `Prompt Cache (${overallRate}% | Total: $${totalCost.toFixed(4)}${writeTitle} | ${fullMissCount} miss · ${partialMissCount} P | Overpaid ~$${overpay.toFixed(4)} | Miss turns: $${missCost.toFixed(4)} [${missPct}%]${avgTitle} | Enter to inspect)`;
         const chosen = await ctx.ui.select(title, options);
         if (chosen) {
           const match = chosen.match(/Turn\s+(\d+):/);
@@ -480,7 +622,7 @@ export default function (pi: ExtensionAPI) {
                   `• Output Generated: ${t.output.toLocaleString()}`,
                   `• Total Prompt: ${t.totalPrompt.toLocaleString()} (${t.hitPct.toFixed(1)}% cached)`,
                   ...perfLines,
-                  !t.isHit ? `• Cost because of miss: ~$${(t.cost * 0.9).toFixed(4)} extra vs if cached` : "",
+                  !t.isHit ? `• Estimated overpay: ~$${t.overpay.toFixed(4)} vs a full hit (prior prefix re-sent uncached)` : "",
                 ].filter(Boolean).join("\n");
                 ctx.ui.notify(detail, "info");
               }
@@ -495,103 +637,80 @@ export default function (pi: ExtensionAPI) {
     const writeK = Math.round(totalWriteTokens / 1000);
     const writeTitle = totalWriteTokens > 0 ? ` | Write: ${writeK}k [$${writeCost.toFixed(4)}]` : "";
     ctx.ui?.notify?.(
-      `📊 Prompt Cache Breakdown (${overallRate}% overall | Total: $${totalCost.toFixed(4)}${writeTitle} | Miss Cost: $${missCost.toFixed(4)}${avgTitle}):\n\n${options.join("\n")}`,
+      `📊 Prompt Cache Breakdown (${overallRate}% overall | Total: $${totalCost.toFixed(4)}${writeTitle} | Overpaid ~$${overpay.toFixed(4)} | Miss turns: $${missCost.toFixed(4)}${avgTitle}):\n\n${options.join("\n")}`,
       "info"
     );
   }
 
   // 1. Proactive affinity routing & provider-specific cache key handling
   pi.on("before_provider_headers", (event, ctx) => {
-    const provider = ctx.model?.provider || "";
-    const api = ctx.model?.api || "";
-    const baseUrl = ctx.model?.baseUrl || "";
     const sessionId = ctx.sessionManager?.getSessionId?.();
     if (!sessionId) return;
 
-    const isMistral =
-      provider === "mistral" ||
-      api === "mistral-conversations" ||
-      baseUrl.includes("mistral.ai");
-    const isOpencodeGo =
-      provider === "opencode-go" ||
-      baseUrl.includes("opencode.ai");
+    const match = findRule(loadProviders(), ctx.model);
+    if (!match) return;
+    const { id: ruleId, rule } = match;
 
-    if (isMistral) {
-      event.headers["x-affinity"] = sessionId;
+    for (const h of rule.headers ?? ["x-affinity"]) event.headers[h] = sessionId;
+    if (rule.bodyCacheKey === "strip") {
       event.headers["prompt_cache_key"] = null as any;
       event.headers["prompt-cache-key"] = null as any;
-    } else if (isOpencodeGo) {
-      event.headers["x-affinity"] = sessionId;
-      event.headers["x-session-affinity"] = sessionId;
-      event.headers["session-id"] = sessionId;
     }
 
-    if (process.env.PI_DEBUG_MISTRAL) {
-      try {
-        const redacted: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(event.headers || {})) {
-          redacted[k] = k.toLowerCase() === "authorization" ? "[REDACTED]" : v;
-        }
-        appendFileSync(
-          join(homedir(), ".pi/agent/mistral-requests.log"),
-          JSON.stringify({
-            timestamp: new Date().toISOString(),
-            event: "outgoing_headers",
-            provider,
-            api,
-            model: ctx.model?.id,
-            sessionId,
-            x_affinity: event.headers["x-affinity"],
-            headers: redacted,
-          }) + "\n"
-        );
-      } catch {}
+    if (DEBUG_HEADERS) {
+      appendRotating(
+        REQUEST_LOG_FILE,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          event: "outgoing_headers",
+          rule: ruleId,
+          provider: ctx.model?.provider,
+          api: ctx.model?.api,
+          model: ctx.model?.id,
+          sessionId,
+          x_affinity: event.headers["x-affinity"],
+          headers: redactHeaders(event.headers),
+        }) + "\n"
+      );
     }
   });
 
   pi.on("after_provider_response", (event, ctx) => {
-    if (!process.env.PI_DEBUG_MISTRAL) return;
-    try {
-      appendFileSync(
-        join(homedir(), ".pi/agent/mistral-requests.log"),
-        JSON.stringify({
-          timestamp: new Date().toISOString(),
-          event: "response_received",
-          provider: ctx.model?.provider,
-          model: ctx.model?.id,
-          status: event.status,
-          response_headers: event.headers,
-        }) + "\n"
-      );
-    } catch {}
+    if (!DEBUG_HEADERS) return;
+    const match = findRule(loadProviders(), ctx.model);
+    if (!match) return;
+    appendRotating(
+      REQUEST_LOG_FILE,
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: "response_received",
+        rule: match.id,
+        provider: ctx.model?.provider,
+        model: ctx.model?.id,
+        status: event.status,
+        response_headers: redactHeaders(event.headers as Record<string, unknown>),
+      }) + "\n"
+    );
   });
 
   pi.on("before_provider_request", (event, ctx) => {
     activeReqStartMs = Date.now();
     activeFirstStreamMs = null;
 
-    const provider = ctx.model?.provider || "";
-    const api = ctx.model?.api || "";
-    const baseUrl = ctx.model?.baseUrl || "";
     const sessionId = ctx.sessionManager?.getSessionId?.();
-
-    const isMistral =
-      provider === "mistral" ||
-      api === "mistral-conversations" ||
-      baseUrl.includes("mistral.ai");
-    const isOpencodeGo =
-      provider === "opencode-go" ||
-      baseUrl.includes("opencode.ai");
+    const match = findRule(loadProviders(), ctx.model);
+    if (!match) return;
 
     if (event.payload && typeof event.payload === "object") {
       const payload = event.payload as Record<string, unknown>;
-      if (isMistral) {
-        // Mistral uses x-affinity header only; prompt_cache_key in body conflicts and causes worker bounce misses
+      if (match.rule.bodyCacheKey === "strip") {
+        // x-affinity header only; a body prompt_cache_key may conflict with it
         delete payload.promptCacheKey;
         delete payload.prompt_cache_key;
-      } else if (isOpencodeGo && sessionId) {
+      } else if (match.rule.bodyCacheKey === "inject" && sessionId) {
         payload.prompt_cache_key = sessionId;
       }
+      logPrefixHashes(match.id, ctx.model?.id || "", sessionId || "", payload);
     }
   });
 

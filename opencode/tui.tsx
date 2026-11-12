@@ -10,28 +10,33 @@ const CONFIG_FILE = join(homedir(), ".local/share/opencode/cache-monitor-config.
 const DEFAULT_P_MISS_PCT = 10;
 const DEFAULT_MISS_PCT = 50;
 
-function loadThresholds(): { pMissPct: number; missPct: number } {
+function readConfigFile(): Record<string, any> {
   try {
-    const raw = readFileSync(CONFIG_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    const pMissPct =
-      typeof parsed?.pMissPct === "number" && Number.isFinite(parsed.pMissPct) && parsed.pMissPct >= 0 && parsed.pMissPct <= 100
-        ? parsed.pMissPct
-        : DEFAULT_P_MISS_PCT;
-    const missPct =
-      typeof parsed?.missPct === "number" && Number.isFinite(parsed.missPct) && parsed.missPct >= 0 && parsed.missPct <= 100
-        ? parsed.missPct
-        : DEFAULT_MISS_PCT;
-    return { pMissPct, missPct };
+    const parsed = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
-    return { pMissPct: DEFAULT_P_MISS_PCT, missPct: DEFAULT_MISS_PCT };
+    return {};
   }
+}
+
+function loadThresholds(): { pMissPct: number; missPct: number } {
+  const parsed = readConfigFile();
+  const pMissPct =
+    typeof parsed?.pMissPct === "number" && Number.isFinite(parsed.pMissPct) && parsed.pMissPct >= 0 && parsed.pMissPct <= 100
+      ? parsed.pMissPct
+      : DEFAULT_P_MISS_PCT;
+  const missPct =
+    typeof parsed?.missPct === "number" && Number.isFinite(parsed.missPct) && parsed.missPct >= 0 && parsed.missPct <= 100
+      ? parsed.missPct
+      : DEFAULT_MISS_PCT;
+  return { pMissPct, missPct };
 }
 
 function saveThresholds(pMissPct: number, missPct: number) {
   try {
     mkdirSync(dirname(CONFIG_FILE), { recursive: true });
-    writeFileSync(CONFIG_FILE, JSON.stringify({ pMissPct, missPct }, null, 2));
+    // Read-modify-write so the "providers" section (used by index.ts) is preserved.
+    writeFileSync(CONFIG_FILE, JSON.stringify({ ...readConfigFile(), pMissPct, missPct }, null, 2));
   } catch {}
 }
 
@@ -46,6 +51,7 @@ function parsePctInput(raw?: string): number | null {
 interface TurnDetail {
   turn: number;
   isHit: boolean;
+  isPartialMiss: boolean;
   isColdPrefill: boolean;
   isWarmPrefill: boolean;
   readK: number;
@@ -72,21 +78,36 @@ function currentSessionID(context: any): string | undefined {
   return undefined;
 }
 
+// The database can be very large and the badge refreshes every 2s, so keep one
+// read-only handle and only re-parse a session when its rows changed.
+let sharedDb: Database | null = null;
+const turnCache = new Map<string, { sig: string; turns: TurnDetail[] }>();
+
+function getDb(): Database {
+  if (!sharedDb) sharedDb = new Database(DB_FILE, { readonly: true });
+  return sharedDb;
+}
+
 function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
   if (!sessionID) return [];
   const { pMissPct, missPct } = loadThresholds();
   const strictHitFloor = Math.max(0, Math.min(1, (100 - pMissPct) / 100));
   const completeHitFloor = Math.max(0, Math.min(1, (100 - missPct) / 100));
   try {
-    const db = new Database(DB_FILE, { readonly: true });
+    const db = getDb();
+    const head = db
+      .query(`SELECT COUNT(*) AS c, MAX(time_created) AS m FROM session_message WHERE session_id = ?`)
+      .get(sessionID) as any;
+    const sig = `${head?.c}:${head?.m}:${pMissPct}:${missPct}`;
+    const cached = turnCache.get(sessionID);
+    if (cached && cached.sig === sig) return cached.turns;
+
     const rows = db.query(`
       SELECT data
       FROM session_message
       WHERE session_id = ?
       ORDER BY time_created ASC
     `).all(sessionID) as any[];
-
-    db.close();
 
     const turns: TurnDetail[] = [];
     let turn = 0;
@@ -140,12 +161,13 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
             turnWriteTokens = explicitWrite;
             label = `T${turn} Miss (${fmtK(read)}) ${shortCost}`;
             description = `${pctStr}% (${fmtK(read)}/${fmtK(total)})`;
-            detail = `Cache Miss: ${pctStr}% cached (${read.toLocaleString()} / ${total.toLocaleString()} tokens · ${costStr}, miss penalty ~$${(cost * 0.9).toFixed(4)})`;
+            detail = `Cache Miss: ${pctStr}% cached (${read.toLocaleString()} / ${total.toLocaleString()} tokens · turn cost ${costStr})`;
           }
 
           turns.push({
             turn,
             isHit,
+            isPartialMiss,
             isColdPrefill,
             isWarmPrefill,
             readK,
@@ -160,8 +182,10 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
         }
       } catch {}
     }
+    turnCache.set(sessionID, { sig, turns });
     return turns;
   } catch {
+    sharedDb = null; // reopen on next call
     return [];
   }
 }
@@ -203,7 +227,9 @@ async function openHistoryDialog(context: any, sessionID?: string) {
   const missPct = totalCost > 0 ? ((missCost / totalCost) * 100).toFixed(1) : "0.0";
   const writeK = Math.round(writeTokens / 1000);
   const writeStr = writeTokens > 0 ? ` | W:${writeK}k` : "";
-  const title = `Cache ${turns.length}t · $${totalCost.toFixed(2)}${writeStr} | Miss:$${missCost.toFixed(2)} (${missPct}%)`;
+  const fullMisses = turns.filter((t) => !t.isColdPrefill && !t.isHit && !t.isPartialMiss).length;
+  const partialMisses = turns.filter((t) => t.isPartialMiss).length;
+  const title = `Cache ${turns.length}t · $${totalCost.toFixed(2)}${writeStr} | ${fullMisses} miss · ${partialMisses} P | miss turns $${missCost.toFixed(2)} (${missPct}%)`;
 
   const options = [...turns].reverse().map((t) => ({
     title: t.label,
@@ -342,19 +368,20 @@ export default Plugin.define({
       const turns = getSessionTurnHistory(sid);
       if (turns.length === 0) return null;
 
-      let missCount = 0;
+      let fullMiss = 0;
+      let partialMiss = 0;
       let totalRead = 0;
       let totalAll = 0;
 
       for (const t of turns) {
-        if (!t.isColdPrefill && !t.isHit) {
-          missCount++;
-        }
+        if (t.isPartialMiss) partialMiss++;
+        else if (!t.isColdPrefill && !t.isHit) fullMiss++;
         totalRead += t.readTokens;
         totalAll += t.totalTokens;
       }
 
       const rate = totalAll > 0 ? ((totalRead / totalAll) * 100).toFixed(0) : "100";
+      const missCount = fullMiss + partialMiss;
       const isOk = missCount === 0;
 
       return (
@@ -371,7 +398,7 @@ export default Plugin.define({
           </text>
           <text fg={isOk ? "#3fb950" : "#f85149"} wrapMode="none">
             {" "}
-            ({missCount}/{turns.length} miss)
+            ({fullMiss} miss · {partialMiss} P / {turns.length})
           </text>
         </box>
       );

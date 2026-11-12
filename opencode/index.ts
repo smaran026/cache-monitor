@@ -1,94 +1,152 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { createHash } from "crypto";
 
-const LOG_FILE = path.join(os.homedir(), ".local/share/opencode/mistral-affinity.log");
-const STATE_FILE = path.join(os.homedir(), ".local/share/opencode/cache-monitor.json");
+// ---------------------------------------------------------------------------
+// Provider rules (configurable)
+//
+// A rule is keyed by provider id (the `providerID` OpenCode reports). Add or
+// override rules in the "providers" object of
+//   ~/.local/share/opencode/cache-monitor-config.json
+// Set a built-in rule to null to disable it. Example:
+//   { "providers": { "my-gateway": { "urls": ["gw.example.com"],
+//       "headers": ["x-affinity"], "bodyCacheKey": "inject" },
+//       "opencode-go": null } }
+//
+// bodyCacheKey: "strip"  remove prompt_cache_key from headers and JSON body
+//               "inject" set prompt_cache_key = affinity id in the JSON body
+//               "keep"   leave it untouched (default)
+// ---------------------------------------------------------------------------
+
+type BodyKeyMode = "strip" | "inject" | "keep";
+
+interface ProviderRule {
+  ids?: string[]; // extra provider ids that use this rule
+  urls?: string[]; // substrings matched against the request URL
+  headers?: string[]; // header names set to the affinity id
+  bodyCacheKey?: BodyKeyMode;
+}
+
+const DEFAULT_PROVIDERS: Record<string, ProviderRule> = {
+  mistral: {
+    urls: ["mistral.ai", "codestral"],
+    headers: ["x-affinity"],
+    bodyCacheKey: "strip",
+  },
+  "opencode-go": {
+    urls: ["opencode.ai"],
+    headers: ["x-affinity", "x-session-affinity", "session-id"],
+    bodyCacheKey: "inject",
+  },
+};
+
+const DATA_DIR = path.join(os.homedir(), ".local/share/opencode");
+const CONFIG_FILE = path.join(DATA_DIR, "cache-monitor-config.json");
+const LOG_FILE = path.join(DATA_DIR, "mistral-affinity.log");
+const PREFIX_LOG_FILE = path.join(DATA_DIR, "cache-prefix.log");
+const MAX_LOG_BYTES = 512 * 1024;
+
+// Logging is off unless OC_AFFINITY_DEBUG=1 (routing lines) or
+// OC_AFFINITY_PREFIX=1 (request-body prefix hashes, see README).
+const DEBUG = !!process.env.OC_AFFINITY_DEBUG;
+const PREFIX_DEBUG = !!process.env.OC_AFFINITY_PREFIX;
+
+function appendRotating(file: string, line: string) {
+  try {
+    try {
+      if (fs.statSync(file).size > MAX_LOG_BYTES) fs.renameSync(file, file + ".1");
+    } catch {}
+    fs.appendFileSync(file, line);
+  } catch {}
+}
 
 function log(msg: string) {
-  try {
-    const line = `[${new Date().toISOString()}] ${msg}\n`;
-    fs.appendFileSync(LOG_FILE, line);
-  } catch {}
+  if (!DEBUG) return;
+  appendRotating(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`);
 }
 
-function updateState(updater: (state: any) => void) {
+function loadProviders(): Record<string, ProviderRule> {
+  const merged: Record<string, ProviderRule> = { ...DEFAULT_PROVIDERS };
   try {
-    let state: any = {
-      sessionID: "",
-      turnCount: 0,
-      totalPrompt: 0,
-      totalCached: 0,
-      overallRate: 100,
-      zeroMisses: 0,
-      partialMisses: 0,
-      lastTurnPrompt: 0,
-      lastTurnCached: 0,
-      lastTurnHitPct: 100,
-      lastModel: "",
-      lastProvider: "",
-      updatedAt: Date.now(),
-    };
-    if (fs.existsSync(STATE_FILE)) {
-      try {
-        state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      } catch {}
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+    const user = parsed?.providers;
+    if (user && typeof user === "object") {
+      for (const [id, rule] of Object.entries(user)) {
+        if (rule === null) delete merged[id];
+        else if (typeof rule === "object") merged[id] = rule as ProviderRule;
+      }
     }
-    updater(state);
-    state.updatedAt = Date.now();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   } catch {}
+  return merged;
 }
 
-function isAffinityTarget(req: any, url: string): boolean {
-  const provider = req?.model?.providerID || "";
-  const modelId = req?.model?.id || "";
-  return (
-    provider === "mistral" ||
-    provider === "opencode-go" ||
-    url.includes("mistral.ai") ||
-    url.includes("codestral") ||
-    url.includes("opencode.ai/zen") ||
-    modelId.includes("deepseek") ||
-    modelId.includes("qwen") ||
-    modelId.includes("minimax") ||
-    modelId.includes("glm")
+function findRule(
+  providers: Record<string, ProviderRule>,
+  providerID: string,
+  url: string
+): { id: string; rule: ProviderRule } | null {
+  for (const [id, rule] of Object.entries(providers)) {
+    if (providerID && (providerID === id || rule.ids?.includes(providerID))) return { id, rule };
+  }
+  if (url) {
+    for (const [id, rule] of Object.entries(providers)) {
+      if (rule.urls?.some((u) => url.includes(u))) return { id, rule };
+    }
+  }
+  return null;
+}
+
+function logPrefixHashes(providerId: string, model: string, affinity: string, bodyText: string) {
+  if (!PREFIX_DEBUG) return;
+  const hashes: Record<string, string> = {};
+  for (const kb of [4, 32, 128]) {
+    const n = kb * 1024;
+    if (bodyText.length >= n) {
+      hashes[`first_${kb}k`] = createHash("sha1").update(bodyText.slice(0, n)).digest("hex").slice(0, 12);
+    }
+  }
+  appendRotating(
+    PREFIX_LOG_FILE,
+    JSON.stringify({ t: new Date().toISOString(), provider: providerId, model, affinity, bytes: bodyText.length, ...hashes }) + "\n"
   );
 }
 
 export default {
   id: "oc-mistral-affinity",
   setup(context: any) {
-    log("oc-mistral-affinity plugin loaded (supports Mistral & OpenCode Go)");
+    log("oc-mistral-affinity plugin loaded");
 
     if (!context?.session?.hook) {
       log("context.session.hook is not available");
       return;
     }
 
-    // 1. Hook model.request: set x-affinity & session-id headers on model requests
+    // 1. model.request: set affinity headers on model requests
     context.session.hook("model.request", async (req: any) => {
       try {
         const url = typeof req?.baseURL === "string" ? req.baseURL : "";
-        if (!isAffinityTarget(req, url)) return;
+        const match = findRule(loadProviders(), req?.model?.providerID || "", url);
+        if (!match) return;
 
         if (req?.headers && req?.sessionID) {
-          req.headers["x-affinity"] = req.sessionID;
-          req.headers["session-id"] = req.sessionID;
+          for (const h of match.rule.headers ?? ["x-affinity"]) req.headers[h] = req.sessionID;
         }
       } catch (e: any) {
         log(`model.request error: ${e?.message}`);
       }
     });
 
-    // 2. Hook http.request: inject x-affinity HTTP header and strip prompt_cache_key
+    // 2. http.request: set affinity headers, handle prompt_cache_key
     context.session.hook("http.request", async (req: any) => {
       try {
         const url = req?.request?.url || "";
-        if (!isAffinityTarget(req, url)) return;
+        const match = findRule(loadProviders(), req?.model?.providerID || "", url);
+        if (!match) return;
+        const { id: ruleId, rule } = match;
 
         const headers = req.request.headers;
-        // Retrieve affinity session ID (root session ID if forked/subagent, otherwise current sessionID)
+        // Root session id if forked/subagent, otherwise the current session id
         const affinity =
           headers.get("x-session-affinity") ||
           headers.get("x-opencode-session") ||
@@ -97,48 +155,47 @@ export default {
           req.sessionID;
 
         if (affinity) {
-          headers.set("x-affinity", affinity);
-          headers.set("session-id", affinity);
+          for (const h of rule.headers ?? ["x-affinity"]) headers.set(h, affinity);
         }
 
-        // Remove conflicting cache key headers if present
-        headers.delete("prompt_cache_key");
-        headers.delete("prompt-cache-key");
+        const mode: BodyKeyMode = rule.bodyCacheKey ?? "keep";
+        if (mode === "strip") {
+          headers.delete("prompt_cache_key");
+          headers.delete("prompt-cache-key");
+        }
 
-        const provider = req?.model?.providerID || (url.includes("opencode.ai") ? "opencode-go" : "mistral");
         const model = req?.model?.id || "unknown";
-        const isDirectMistral =
-          provider === "mistral" ||
-          url.includes("mistral.ai") ||
-          url.includes("codestral");
-
-        // Inspect body: strip prompt_cache_key for direct Mistral (x-affinity only), inject for opencode-go
         let bodyModified = false;
         let bodyText: string | null = null;
         try {
           bodyText = await req.request.clone().text();
         } catch {}
 
-        if (bodyText && (bodyText.startsWith("{") || bodyText.startsWith("["))) {
+        if (bodyText) logPrefixHashes(ruleId, model, String(affinity ?? ""), bodyText);
+
+        if (mode !== "keep" && bodyText && (bodyText.startsWith("{") || bodyText.startsWith("["))) {
           try {
             const body = JSON.parse(bodyText);
             if (body && typeof body === "object") {
-              if (isDirectMistral) {
+              if (mode === "strip") {
                 if ("prompt_cache_key" in body || "promptCacheKey" in body) {
                   delete body.prompt_cache_key;
                   delete body.promptCacheKey;
                   bodyModified = true;
                 }
-              } else if (affinity) {
+              } else if (mode === "inject" && affinity && body.prompt_cache_key !== affinity) {
                 body.prompt_cache_key = affinity;
                 bodyModified = true;
               }
             }
             if (bodyModified) {
+              const newHeaders = new Headers(req.request.headers);
+              newHeaders.delete("content-length"); // body length changed
               req.request = new Request(req.request.url, {
                 method: req.request.method,
-                headers: req.request.headers,
+                headers: newHeaders,
                 body: JSON.stringify(body),
+                signal: req.request.signal, // keep cancellation working
               });
             }
           } catch (err: any) {
@@ -146,24 +203,7 @@ export default {
           }
         }
 
-        log(
-          `Routed ${provider}/${model}: affinity=${affinity} direct_mistral=${isDirectMistral} body_modified=${bodyModified} url=${url}`
-        );
-
-        // Update session monitor state
-        updateState((s) => {
-          if (s.sessionID !== req.sessionID) {
-            s.sessionID = req.sessionID || "";
-            s.turnCount = 0;
-            s.totalPrompt = 0;
-            s.totalCached = 0;
-            s.zeroMisses = 0;
-            s.partialMisses = 0;
-          }
-          s.turnCount = (s.turnCount || 0) + 1;
-          s.lastModel = model;
-          s.lastProvider = provider;
-        });
+        log(`Routed ${ruleId}/${model}: affinity=${affinity} mode=${mode} body_modified=${bodyModified} url=${url}`);
       } catch (e: any) {
         log(`http.request error: ${e?.message}`);
       }

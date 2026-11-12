@@ -1,5 +1,6 @@
 # Logs
 *.log
+*.log.1
 
 # Backup files created by the installer
 *.bak

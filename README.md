@@ -1,18 +1,19 @@
 # cache-monitor
 
-Per-turn prompt cache hit rate tracking and affinity routing for coding agent sessions.
+Per-turn prompt cache hit rate tracking, plus optional affinity routing headers, for coding agent sessions.
 
-Works with **Pi coding agent** and **OpenCode Go**. The core logic is provider-agnostic and can be adapted to any client that exposes pre-request and post-response hooks.
+Works with **Pi coding agent** and **OpenCode Go**. The classification logic is provider-agnostic and can be adapted to any client that exposes pre-request and post-response hooks.
 
 ---
 
 ## What it does
 
 - Tracks cache hit rate and cost per turn for every assistant response
-- Shows a live footer badge: `⚡ 99% cache (1/400 miss)`
+- Shows a live footer badge: `⚡ 99% cache (1 miss · 2 P / 400)`
 - Alerts on cache misses in real time with exact token counts and cost
-- Sets `x-affinity` and strips conflicting `prompt_cache_key` headers on outgoing requests (Mistral) so the backend routes consistently to the same KV replica
-- Classifies turns as: **Cold Prefill** (turn 1 warmup), **Warm Prefill** (turn 1 cache reuse), **Hit**, **P Miss** (partial miss, configurable threshold), or **Miss**
+- Sends affinity headers (and handles `prompt_cache_key`) per provider, driven by a configurable provider list (see below)
+- Classifies turns as: **Cold Prefill** (turn 1 warmup), **Warm Prefill** (turn 1 cache reuse), **Hit**, **P Miss** (partial miss) or **Miss**
+- Estimates the extra money each miss cost you (**overpaid**), separately from the total cost of the turns that missed
 - Tracks tokens-per-second (`ts`) and time-to-first-stream (`ttfs`) per turn
 - Commands: `/cache` (interactive history), `/cache <pct>` (set P Miss threshold), `/cache_c <pct>` (set Miss threshold)
 - Keyboard shortcut: `Ctrl+Alt+C` (Pi only) to open the cache history modal
@@ -21,9 +22,9 @@ Works with **Pi coding agent** and **OpenCode Go**. The core logic is provider-a
 
 ## Why
 
-Mistral's flash models (`deepseek-v4-1-flash`, `zai-glm-5-3-flash`) bounce between backend replicas when multiple sessions run concurrently. This causes cache hit rates to drop from 99% to 0% repeatedly within the same session. On a bad session, 80%+ of the bill can come from cache misses alone.
+Some hosted models bounce between backend replicas that do not share a KV cache. Cache hit rate then drops from 99% to 0% for a turn or two, even though the client sent the same prompt prefix. This plugin makes that visible and sends the routing hints the provider may honour (`x-affinity` and friends).
 
-This plugin makes it visible and routes requests to reduce bouncing.
+Whether the hints help is provider dependent. On our Mistral sessions they did not prevent bouncing under load (see "What this can and cannot do").
 
 ---
 
@@ -37,21 +38,17 @@ cd cache-monitor
 bash scripts/install.sh
 ```
 
-The script prompts you to choose Pi, OpenCode, or both. It backs up any existing files before overwriting.
+The script prompts you to choose Pi, OpenCode, or both. It backs up any existing files (timestamped `.bak`) before overwriting.
 
 ### Manual
 
 #### Pi coding agent
 
-Copy `pi/cache-monitor.ts` into your Pi extensions directory:
-
 ```bash
 cp pi/cache-monitor.ts ~/.pi/agent/extensions/cache-monitor.ts
 ```
 
-Then restart Pi or run `/reload`.
-
-Verify the build:
+Then restart Pi or run `/reload`. To check the file parses:
 
 ```bash
 bun build ~/.pi/agent/extensions/cache-monitor.ts --no-bundle --outfile /tmp/cm-check.js && rm /tmp/cm-check.js && echo OK
@@ -59,26 +56,26 @@ bun build ~/.pi/agent/extensions/cache-monitor.ts --no-bundle --outfile /tmp/cm-
 
 #### OpenCode Go
 
-Copy the three files into a local plugin directory:
-
 ```bash
 mkdir -p ~/.config/opencode/local-plugins/oc-mistral-affinity
-cp opencode/index.ts   ~/.config/opencode/local-plugins/oc-mistral-affinity/
-cp opencode/tui.tsx    ~/.config/opencode/local-plugins/oc-mistral-affinity/
-cp opencode/package.json ~/.config/opencode/local-plugins/oc-mistral-affinity/
+cp opencode/index.ts opencode/tui.tsx opencode/package.json ~/.config/opencode/local-plugins/oc-mistral-affinity/
 ```
 
-Register the plugin in your OpenCode config (`~/.config/opencode/config.json`):
+The plugin has two halves, registered in two files:
+
+`~/.config/opencode/opencode.json` (request hooks, `index.ts`):
 
 ```json
-{
-  "plugins": [
-    "~/.config/opencode/local-plugins/oc-mistral-affinity"
-  ]
-}
+{ "plugin": ["./local-plugins/oc-mistral-affinity"] }
 ```
 
-Then restart OpenCode.
+`~/.config/opencode/cli.json` (footer badge and `/cache`, `tui.tsx`):
+
+```json
+{ "plugins": ["./local-plugins/oc-mistral-affinity"] }
+```
+
+Restart OpenCode afterwards.
 
 ---
 
@@ -94,7 +91,7 @@ Then restart OpenCode.
 | `/cache-widget` | Toggle persistent widget below the editor |
 | `Ctrl+Alt+C` | Open cache history modal |
 
-The footer status bar shows: `⚡ 99.5% cache (1 miss · $0.0062 lost) | Turn 42: Hit (312k cached) - $0.0021`
+Footer example: `⚡ 99.5% cache (1 miss · 2 P · ~$0.0062 overpaid) | Turn 42: Hit (312k cached) - $0.0021`
 
 ### OpenCode
 
@@ -104,7 +101,7 @@ The footer status bar shows: `⚡ 99.5% cache (1 miss · $0.0062 lost) | Turn 42
 | `/cache 15` | Set P Miss threshold |
 | `/cache_c 60` | Set Miss threshold |
 
-The footer badge shows: `⚡ 99% cache (1/400 miss)` — click it to open the history dialog.
+The footer badge shows `⚡ 99% cache (1 miss · 2 P / 400)`. Click it to open the history dialog.
 
 ---
 
@@ -115,38 +112,83 @@ The footer badge shows: `⚡ 99% cache (1/400 miss)` — click it to open the hi
 | **Hit** | >= 90% of prompt tokens were cached |
 | **P Miss** (Partial Miss) | Between 50% and 90% cached |
 | **Miss** | < 50% cached |
-| **Cold Prefill** | Turn 1, < 50% cached (initial warmup, excluded from miss count) |
+| **Cold Prefill** | Turn 1, < 50% cached (initial warmup, excluded from miss counts) |
 | **Warm Prefill** | Turn 1, >= 50% cached (prior session cache reused) |
 
-Thresholds are configurable per session and persisted to disk:
+Miss counts are reported as full misses and P Misses separately. Both feed "cost of miss turns".
+
+Thresholds are configurable and persisted to:
 - Pi: `~/.pi/agent/cache-monitor-config.json`
 - OpenCode: `~/.local/share/opencode/cache-monitor-config.json`
 
+### Two cost figures
+
+- **Overpaid (Pi)**: estimated extra spend. Tokens of the previous turn's prompt that were not read from cache are charged at (input price - cache-read price). It is an estimate; it assumes the previous prompt should have been cached.
+- **Cost of miss turns**: the full cost of every turn classified Miss or P Miss, including output tokens and the cached part. Always larger than the overpay. OpenCode shows only this figure, because it does not expose a per-token price breakdown.
+
 ---
 
-## Debug logging (Pi only)
+## Configuring providers
 
-To log outgoing and incoming Mistral headers for each request:
+Which providers get affinity handling is a list of rules keyed by provider id. Built-ins: `mistral` and `opencode-go`. Add your own, override a built-in, or disable one (`null`) in the same config file as the thresholds, under `"providers"`:
 
-```bash
-PI_DEBUG_MISTRAL=1 pi -p --model mistral/deepseek-v4-1-flash-1017
+```json
+{
+  "providers": {
+    "my-gateway": {
+      "urls": ["gw.example.com"],
+      "headers": ["x-affinity"],
+      "bodyCacheKey": "inject"
+    },
+    "opencode-go": null
+  }
+}
 ```
 
-Logs are written to `~/.pi/agent/mistral-requests.log`.
+| Field | Meaning |
+|---|---|
+| key | Provider id as reported by the harness (`model.provider` in Pi, `providerID` in OpenCode) |
+| `ids` | Extra provider ids that use the same rule |
+| `urls` | Substrings matched against the base URL when the id does not match |
+| `apis` | (Pi) `model.api` values that match |
+| `headers` | Header names set to the session id |
+| `bodyCacheKey` | `strip` removes `prompt_cache_key` from headers and body, `inject` sets it to the session id, `keep` (default) leaves it alone |
+
+Built-in rules:
+
+| Rule | Headers | `prompt_cache_key` |
+|---|---|---|
+| `mistral` | `x-affinity` | strip |
+| `opencode-go` | `x-affinity`, `x-session-affinity`, `session-id` | inject |
+
+Providers without a rule are never touched. Changes are read on every request, no restart needed.
 
 ---
 
-## How the affinity routing works
+## Debugging
 
-**Mistral (`api.mistral.ai`):**
-- Adds `x-affinity: <sessionId>` to every request header
-- Strips `prompt_cache_key` / `prompt-cache-key` from headers and JSON body (sending both causes the backend to treat them as conflicting routing signals and bounce to a different replica)
+Nothing is logged by default.
 
-**OpenCode Go:**
-- Adds `x-affinity: <sessionId>`, `x-session-affinity`, and `session-id` headers
-- Injects `prompt_cache_key: <sessionId>` into the request body
+| Variable | Harness | Writes |
+|---|---|---|
+| `PI_DEBUG_AFFINITY=1` (or legacy `PI_DEBUG_MISTRAL=1`) | Pi | Outgoing and response headers of matched providers to `~/.pi/agent/mistral-requests.log` |
+| `PI_DEBUG_PREFIX=1` | Pi | Hashes of the request body prefix to `~/.pi/agent/cache-prefix.log` |
+| `OC_AFFINITY_DEBUG=1` | OpenCode | Routing lines to `~/.local/share/opencode/mistral-affinity.log` |
+| `OC_AFFINITY_PREFIX=1` | OpenCode | Hashes of the request body prefix to `~/.local/share/opencode/cache-prefix.log` |
 
-The backend still bounces under heavy concurrent load — this reduces the frequency but cannot eliminate it entirely. Running one active session at a time gives the best cache hit rate.
+Credential headers (`authorization`, `x-api-key`, `api-key`, `cookie`, `set-cookie`) are redacted. Logs rotate at 512 KB (`.log.1`).
+
+### Telling "our prompt changed" apart from "the provider bounced"
+
+With the prefix log on, each request records the SHA-1 prefix of its body at 4 KB, 32 KB and 128 KB. If a miss turn has the same `first_32k` hash as the turn before it, the prompt prefix did not change and the miss happened on the provider side. If the hash differs, something in the client (compaction, a reordered tool list, a timestamp in the system prompt) changed the prefix.
+
+---
+
+## What this can and cannot do
+
+Affinity headers are a hint. If the provider ignores them, or its replicas do not share a KV cache, you will still see turn-to-turn bounces: a 0% turn followed by a 96% turn on the same conversation. The plugin cannot fix that. It can show you how bad it is and let you compare providers (for example Mistral against OpenCode Go in the same hour) so you can route work to the one that holds its cache.
+
+Do not read the hit-rate numbers across providers as a controlled benchmark: sessions differ in length, task and context size, and providers price cached tokens differently.
 
 ---
 
@@ -157,7 +199,7 @@ pi/
   cache-monitor.ts        Pi extension (single file, TypeScript)
 
 opencode/
-  index.ts                Affinity routing hook (model.request + http.request)
+  index.ts                Affinity routing hooks (model.request + http.request)
   tui.tsx                 TUI badge + history dialog + slash commands (SolidJS)
   package.json            Plugin manifest
 
@@ -176,7 +218,7 @@ scripts/
 
 ## Portability
 
-The core classification logic (Cold Prefill / Warm Prefill / Hit / P Miss / Miss, ts/ttfs telemetry) is self-contained TypeScript with no external dependencies beyond Node.js built-ins. Adapting it to another client requires implementing:
+The classification logic (Cold Prefill / Warm Prefill / Hit / P Miss / Miss, ts/ttfs telemetry) is self-contained TypeScript with no dependencies beyond Node.js built-ins. Adapting it to another client requires implementing:
 1. A pre-request hook to inject headers
 2. A post-response hook to read token usage (`input`, `cacheRead`, `cacheWrite`, `output`, `cost`)
 3. A UI hook to display the status badge
@@ -185,4 +227,4 @@ The core classification logic (Cold Prefill / Warm Prefill / Hit / P Miss / Miss
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
