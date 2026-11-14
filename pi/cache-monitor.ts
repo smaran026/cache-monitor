@@ -174,6 +174,7 @@ interface TurnRecord {
   hitPct: number;
   isHit: boolean;
   isPartialMiss: boolean;
+  isCompleteMiss: boolean;
   isColdPrefill: boolean;
   isWarmPrefill: boolean;
   isAborted: boolean;
@@ -291,13 +292,24 @@ export default function (pi: ExtensionAPI) {
             const cached = usage.cacheRead || 0;
             const explicitWrite = usage.cacheWrite || 0;
             const output = usage.output || 0;
-            const cost = usage.cost?.total || 0;
+            let cost = usage.cost?.total || 0;
+            if (cost === 0 && ctx?.model?.cost) {
+              const rates = ctx.model.cost;
+              const inputCost = ((rates.input || 0) / 1000000) * uncached;
+              const outputCost = ((rates.output || 0) / 1000000) * output;
+              const cacheReadCost = ((rates.cacheRead || 0) / 1000000) * cached;
+              const cacheWriteCost = ((rates.cacheWrite || 0) / 1000000) * explicitWrite;
+              cost = inputCost + outputCost + cacheReadCost + cacheWriteCost;
+            }
             const totalPrompt = uncached + cached;
+            const isAborted = totalPrompt === 0 || entry.message.stopReason === "aborted";
 
-            totalUncached += uncached;
-            totalCached += cached;
-            totalOutput += output;
-            totalCost += cost;
+            if (!isAborted) {
+              totalUncached += uncached;
+              totalCached += cached;
+              totalOutput += output;
+              totalCost += cost;
+            }
 
             const msgTs = typeof entry.message.timestamp === "number" ? entry.message.timestamp : 0;
             const savedTiming = msgTs > 0 ? timingsByMsgTs.get(msgTs) : undefined;
@@ -305,8 +317,6 @@ export default function (pi: ExtensionAPI) {
             let turnTotalMs = savedTiming?.totalMs;
             let turnTs = savedTiming?.ts;
             let tsEstimated = false;
-
-            const isAborted = totalPrompt === 0 || entry.message.stopReason === "aborted";
             if (!isAborted && turnTs === undefined && output > 0 && msgTs > 0 && entry.timestamp) {
               const entryEndMs = Date.parse(entry.timestamp);
               if (Number.isFinite(entryEndMs) && entryEndMs > msgTs) {
@@ -331,6 +341,7 @@ export default function (pi: ExtensionAPI) {
 
             let isHit = false;
             let isPartialMiss = false;
+            let isCompleteMiss = false;
             let isColdPrefill = false;
             let isWarmPrefill = false;
             let turnWriteTokens = 0;
@@ -340,17 +351,18 @@ export default function (pi: ExtensionAPI) {
             let turnHitPct = 0;
             let turnOverpay = 0;
 
-            // Overpay estimate: the prompt prefix we expected to be cached is the previous turn's prompt.
-            // Every expected-but-uncached token cost (input rate - cache-read rate) more than a hit.
+            // Overpay estimate: each uncached token on a miss/partial miss costs (inputRate - cacheReadRate) more than a hit.
             const estimateOverpay = (): number => {
-              const expected = Math.min(prevTotalPrompt, totalPrompt);
-              const lost = Math.max(0, expected - cached);
-              if (lost === 0) return 0;
-              const inputRate = uncached > 0 && usage.cost?.input > 0 ? usage.cost.input / uncached : 0;
-              if (inputRate > 0) return lost * Math.max(0, inputRate - lastCacheReadRate);
-              return totalPrompt > 0 ? cost * (lost / totalPrompt) : 0; // no per-token rate available
+              const modelRates = ctx?.model?.cost;
+              const inputRate = modelRates?.input
+                ? modelRates.input / 1000000
+                : (usage.cost?.input && uncached > 0 ? usage.cost.input / uncached : 0.10 / 1000000);
+              const cacheReadRate = modelRates?.cacheRead !== undefined
+                ? modelRates.cacheRead / 1000000
+                : (usage.cost?.cacheRead && cached > 0 ? usage.cost.cacheRead / cached : 0.002 / 1000000);
+              const rateDiff = Math.max(0, inputRate - cacheReadRate);
+              return uncached > 0 ? uncached * rateDiff : 0;
             };
-            if (cached > 0 && usage.cost?.cacheRead > 0) lastCacheReadRate = usage.cost.cacheRead / cached;
 
             if (isAborted) {
               abortedCount++;
@@ -366,8 +378,9 @@ export default function (pi: ExtensionAPI) {
                 cachedStr = cached === 0 ? "0 cached" : `${readK}k cached`;
 
                 if (!isCompleteHit) {
-                  // Cold start: cache warmup from scratch
+                  // Cold start: cache warmup from scratch (not a miss, t1 = 100%)
                   isColdPrefill = true;
+                  turnHitPct = 100;
                   coldPrefillCount++;
                   turnWriteTokens = explicitWrite > 0 ? explicitWrite : uncached;
                   totalWriteTokens += turnWriteTokens;
@@ -391,6 +404,7 @@ export default function (pi: ExtensionAPI) {
                   description = `Warm prefill hit: ${cached.toLocaleString()} cached tokens reused from prior session + ${uncached.toLocaleString()} new tokens sent (${turnHitPct.toFixed(1)}% cached)`;
                 }
               } else if (!isCompleteHit) {
+                isCompleteMiss = true;
                 fullMissCount++;
                 missCost += cost;
                 turnOverpay = estimateOverpay();
@@ -442,6 +456,7 @@ export default function (pi: ExtensionAPI) {
               hitPct: turnHitPct,
               isHit,
               isPartialMiss,
+              isCompleteMiss,
               isColdPrefill,
               isWarmPrefill,
               isAborted,
@@ -468,34 +483,61 @@ export default function (pi: ExtensionAPI) {
 
   function updateStatusAndWidget(ctx: any) {
     if (!ctx?.ui) return;
-    const totalPromptAll = totalUncached + totalCached;
-    const overallRate = totalPromptAll > 0 ? ((totalCached / totalPromptAll) * 100).toFixed(1) : "100";
+    // Turn 1 is initial prefill/warmup, excluded so it does not drag the turn average down. Aborted turns are also excluded.
+    const validTurns = history.filter((t) => t.turn > 1 && !t.isAborted);
+    const validCount = validTurns.length;
+
+    // Turn-averaged cache % excluding turn 1 and aborted turns
+    const overallRate =
+      validCount > 0
+        ? (validTurns.reduce((sum, t) => sum + t.hitPct, 0) / validCount).toFixed(1)
+        : "100.0";
+
+    const pCount = validTurns.filter((t) => t.isPartialMiss).length;
+    const pPct =
+      validCount > 0
+        ? (
+            validTurns.reduce(
+              (sum, t) => sum + (t.isPartialMiss ? (100 - t.hitPct) : 0),
+              0
+            ) / validCount
+          ).toFixed(1)
+        : "0.0";
+
+    const cCount = validTurns.filter((t) => t.isCompleteMiss).length;
+    const cPct =
+      validCount > 0
+        ? (
+            validTurns.reduce(
+              (sum, t) => sum + (t.isCompleteMiss ? (100 - t.hitPct) : 0),
+              0
+            ) / validCount
+          ).toFixed(1)
+        : "0.0";
+
     const writeK = Math.round(totalWriteTokens / 1000);
     const writeStr = totalWriteTokens > 0 ? `${writeK}k write` : "";
     const lastTurn = history[history.length - 1];
-    const missCount = fullMissCount + partialMissCount;
-    const missBreakdown = `${fullMissCount} miss · ${partialMissCount} P`;
+    const hasMisses = pCount > 0 || cCount > 0;
+    const missBreakdown = `P = ${pCount} (${pPct}%)  C = ${cCount} (${cPct}%)`;
+    const overpaidStr = ` · ~$${overpay.toFixed(4)} overpaid`;
 
     // 1. Footer status bar with themed colors & telemetry
     try {
       const theme = ctx.ui.theme;
       let statusMsg = "";
       if (theme) {
-        const icon = missCount === 0 ? theme.fg("success", "⚡") : theme.fg("warning", "⚡");
+        const icon = !hasMisses ? theme.fg("success", "⚡") : theme.fg("warning", "⚡");
         const rateText = theme.fg("accent", ` ${overallRate}% cache`);
         const writeText = writeStr ? theme.fg("dim", ` · ${writeStr}`) : "";
-        const missText =
-          missCount > 0
-            ? theme.fg("error", ` (${missBreakdown} · ~$${overpay.toFixed(4)} overpaid)`)
-            : "";
+        const missText = theme.fg(hasMisses ? "error" : "dim", ` (${missBreakdown}${overpaidStr})`);
         const lastTurnText = lastTurn
           ? theme.fg("dim", ` | ${lastTurn.label}`)
           : "";
         statusMsg = `${icon}${rateText}${writeText}${missText}${lastTurnText}`;
       } else {
         const writeText = writeStr ? ` · ${writeStr}` : "";
-        const missText = missCount > 0 ? ` (${missBreakdown} · ~$${overpay.toFixed(4)} overpaid)` : "";
-        statusMsg = `⚡ Cache: ${overallRate}%${writeText}${missText}${lastTurn ? " | " + lastTurn.label : ""}`;
+        statusMsg = `⚡ Cache: ${overallRate}%${writeText} (${missBreakdown}${overpaidStr})${lastTurn ? " | " + lastTurn.label : ""}`;
       }
       ctx.ui.setStatus("cache_monitor", statusMsg);
     } catch {}
@@ -515,8 +557,8 @@ export default function (pi: ExtensionAPI) {
         if (ttfsCount > 0) avgParts.push(`Avg ttfs: ${formatTtfs(ttfsSum / ttfsCount)}`);
         const avgLine = avgParts.length > 0 ? ` | ${avgParts.join(" · ")}` : "";
         const summary = [
-          `⚡ Prompt Cache: ${overallRate}% | Total Cost: $${totalCost.toFixed(4)} | Overpaid ~$${overpay.toFixed(4)} | Cost of miss turns: $${missCost.toFixed(4)} (${missPct}% of bill)${avgLine}`,
-          `   Cache Write: ${totalWriteTokens.toLocaleString()} tokens ($${writeCost.toFixed(4)}) | Hits: ${turnCount - missCount - abortedCount - coldPrefillCount} | Misses: ${fullMissCount} | P Misses: ${partialMissCount} | Prefill: ${prefillSummary}`,
+          `⚡ Prompt Cache: ${overallRate}% (turn avg) | Total Cost: $${totalCost.toFixed(4)} | Overpaid ~$${overpay.toFixed(4)} | Cost of miss turns: $${missCost.toFixed(4)} (${missPct}% of bill)${avgLine}`,
+          `   Cache Write: ${totalWriteTokens.toLocaleString()} tokens ($${writeCost.toFixed(4)}) | Hits: ${turnCount - fullMissCount - partialMissCount - abortedCount - coldPrefillCount} | ${missBreakdown} | Prefill: ${prefillSummary}`,
           lastTurn ? `   Latest: ${lastTurn.label}` : "",
         ].filter(Boolean);
         ctx.ui.setWidget("cache_monitor_widget", summary, { placement: "belowEditor" });
@@ -529,8 +571,38 @@ export default function (pi: ExtensionAPI) {
   async function showInteractiveModal(ctx: any) {
     syncHistoryFromSession(ctx);
 
-    const totalPromptAll = totalUncached + totalCached;
-    const overallRate = totalPromptAll > 0 ? ((totalCached / totalPromptAll) * 100).toFixed(1) : "100.0";
+    // Turn 1 is initial prefill/warmup, excluded so it does not drag the turn average down. Aborted turns are also excluded.
+    const validTurns = history.filter((t) => t.turn > 1 && !t.isAborted);
+    const validCount = validTurns.length;
+
+    const overallRate =
+      validCount > 0
+        ? (validTurns.reduce((sum, t) => sum + t.hitPct, 0) / validCount).toFixed(1)
+        : "100.0";
+
+    const pCount = validTurns.filter((t) => t.isPartialMiss).length;
+    const pPct =
+      validCount > 0
+        ? (
+            validTurns.reduce(
+              (sum, t) => sum + (t.isPartialMiss ? (100 - t.hitPct) : 0),
+              0
+            ) / validCount
+          ).toFixed(1)
+        : "0.0";
+
+    const cCount = validTurns.filter((t) => t.isCompleteMiss).length;
+    const cPct =
+      validCount > 0
+        ? (
+            validTurns.reduce(
+              (sum, t) => sum + (t.isCompleteMiss ? (100 - t.hitPct) : 0),
+              0
+            ) / validCount
+          ).toFixed(1)
+        : "0.0";
+
+    const missBreakdown = `P = ${pCount} (${pPct}%)  C = ${cCount} (${cPct}%)`;
 
     if (history.length === 0) {
       ctx.ui?.notify?.("No recorded turns with token usage found in this session.", "info");
@@ -548,7 +620,7 @@ export default function (pi: ExtensionAPI) {
         const missPct = totalCost > 0 ? ((missCost / totalCost) * 100).toFixed(1) : "0.0";
         const writeK = Math.round(totalWriteTokens / 1000);
         const writeTitle = totalWriteTokens > 0 ? ` | Write: ${writeK}k [$${writeCost.toFixed(4)}]` : "";
-        const title = `Prompt Cache (${overallRate}% | Total: $${totalCost.toFixed(4)}${writeTitle} | ${fullMissCount} miss · ${partialMissCount} P | Overpaid ~$${overpay.toFixed(4)} | Miss turns: $${missCost.toFixed(4)} [${missPct}%]${avgTitle} | Enter to inspect)`;
+        const title = `Prompt Cache (${overallRate}% | Total: $${totalCost.toFixed(4)}${writeTitle} | ${missBreakdown} | Overpaid ~$${overpay.toFixed(4)} | Miss turns: $${missCost.toFixed(4)} [${missPct}%]${avgTitle} | Enter to inspect)`;
         const chosen = await ctx.ui.select(title, options);
         if (chosen) {
           const match = chosen.match(/Turn\s+(\d+):/);
@@ -637,7 +709,7 @@ export default function (pi: ExtensionAPI) {
     const writeK = Math.round(totalWriteTokens / 1000);
     const writeTitle = totalWriteTokens > 0 ? ` | Write: ${writeK}k [$${writeCost.toFixed(4)}]` : "";
     ctx.ui?.notify?.(
-      `📊 Prompt Cache Breakdown (${overallRate}% overall | Total: $${totalCost.toFixed(4)}${writeTitle} | Overpaid ~$${overpay.toFixed(4)} | Miss turns: $${missCost.toFixed(4)}${avgTitle}):\n\n${options.join("\n")}`,
+      `📊 Prompt Cache Breakdown (${overallRate}% overall | ${missBreakdown} | Total: $${totalCost.toFixed(4)}${writeTitle} | Overpaid ~$${overpay.toFixed(4)} | Miss turns: $${missCost.toFixed(4)}${avgTitle}):\n\n${options.join("\n")}`,
       "info"
     );
   }
