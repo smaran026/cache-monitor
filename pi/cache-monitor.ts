@@ -609,7 +609,52 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const options = [...history].reverse().map((t) => t.label);
+    // Overall token volumes across all valid turns
+    const totalPromptAll = totalUncached + totalCached;
+    const tokenWeightedRate = totalPromptAll > 0 ? ((totalCached / totalPromptAll) * 100).toFixed(1) : "100.0";
+
+    const modelRates = ctx?.model?.cost;
+    const inputRateM = modelRates?.input ?? 0.30;
+    const outputRateM = modelRates?.output ?? 1.20;
+    const cacheReadRateM = modelRates?.cacheRead ?? 0.006;
+    const cacheWriteRateM = modelRates?.cacheWrite ?? 0;
+
+    const uncachedCost = (inputRateM / 1000000) * totalUncached;
+    const outputCost = (outputRateM / 1000000) * totalOutput;
+    const cacheReadCost = (cacheReadRateM / 1000000) * totalCached;
+    const cacheWriteCost = (cacheWriteRateM / 1000000) * totalWriteTokens;
+
+    const calculatedTotal = totalCost > 0 ? totalCost : (uncachedCost + outputCost + cacheReadCost + cacheWriteCost);
+    const outputPct = calculatedTotal > 0 ? ((outputCost / calculatedTotal) * 100).toFixed(1) : "0.0";
+    const cacheReadPct = calculatedTotal > 0 ? ((cacheReadCost / calculatedTotal) * 100).toFixed(1) : "0.0";
+    const uncachedPct = calculatedTotal > 0 ? ((uncachedCost / calculatedTotal) * 100).toFixed(1) : "0.0";
+
+    // Cost without caching (all cached tokens charged at inputRateM instead of cacheReadRateM)
+    const costWithoutCache = calculatedTotal + (totalCached * Math.max(0, (inputRateM - cacheReadRateM) / 1000000));
+    const savedDollar = Math.max(0, costWithoutCache - calculatedTotal);
+    const savedPct = costWithoutCache > 0 ? ((savedDollar / costWithoutCache) * 100).toFixed(1) : "0.0";
+
+    const sessionSummaryOption = `📊 Session Cost & Token Breakdown (${turnCount} turns · $${calculatedTotal.toFixed(4)})`;
+
+    const sessionSummaryLines = [
+      `📊 Session Cost & Token Breakdown (${turnCount} turns total):`,
+      `• Total Spend: $${calculatedTotal.toFixed(4)} (avg $${turnCount > 0 ? (calculatedTotal / turnCount).toFixed(4) : "0.0000"}/turn)`,
+      `• Cache Hit Rate: ${overallRate}% (turn avg) · ${tokenWeightedRate}% (token weighted)`,
+      `• Miss Telemetry: ${missBreakdown} · ~$${overpay.toFixed(4)} overpaid`,
+      ``,
+      `Token & Cost Distribution:`,
+      `• Output / Reasoning (↓): ${totalOutput.toLocaleString()} tokens ($${outputCost.toFixed(4)} · ${outputPct}% of bill @ $${outputRateM.toFixed(2)}/1M)`,
+      `• Prompt Cache Read (R):  ${totalCached.toLocaleString()} tokens ($${cacheReadCost.toFixed(4)} · ${cacheReadPct}% of bill @ $${cacheReadRateM.toFixed(4)}/1M)`,
+      `• Uncached Input (↑):     ${totalUncached.toLocaleString()} tokens ($${uncachedCost.toFixed(4)} · ${uncachedPct}% of bill @ $${inputRateM.toFixed(2)}/1M)`,
+      totalWriteTokens > 0 ? `• Cache Writes (W):        ${totalWriteTokens.toLocaleString()} tokens ($${cacheWriteCost.toFixed(4)})` : "",
+      ``,
+      `Cache Savings Analysis:`,
+      `• Without Cache: ~$${costWithoutCache.toFixed(4)}`,
+      `• Caching Saved: ~$${savedDollar.toFixed(4)} (${savedPct}% saved on input)`,
+      missCost > 0 ? `• Cost on miss turns: $${missCost.toFixed(4)} (${((missCost / calculatedTotal) * 100).toFixed(1)}% of bill)` : "",
+    ].filter(Boolean).join("\n");
+
+    const options = [sessionSummaryOption, ...[...history].reverse().map((t) => t.label)];
     const avgParts: string[] = [];
     if (tsCount > 0) avgParts.push(`Avg ts: ${formatTs(tsSum / tsCount)}`);
     if (ttfsCount > 0) avgParts.push(`Avg ttfs: ${formatTtfs(ttfsSum / ttfsCount)}`);
@@ -623,6 +668,10 @@ export default function (pi: ExtensionAPI) {
         const title = `Prompt Cache (${overallRate}% | Total: $${totalCost.toFixed(4)}${writeTitle} | ${missBreakdown} | Overpaid ~$${overpay.toFixed(4)} | Miss turns: $${missCost.toFixed(4)} [${missPct}%]${avgTitle} | Enter to inspect)`;
         const chosen = await ctx.ui.select(title, options);
         if (chosen) {
+          if (chosen === sessionSummaryOption || chosen.startsWith("📊 Session Cost")) {
+            ctx.ui.notify(sessionSummaryLines, "info");
+            return;
+          }
           const match = chosen.match(/Turn\s+(\d+):/);
           if (match) {
             const num = parseInt(match[1], 10);
@@ -635,6 +684,10 @@ export default function (pi: ExtensionAPI) {
                 t.ttfsMs !== undefined ? `• ttfs: ${formatTtfs(t.ttfsMs)}` : "",
                 t.totalMs !== undefined ? `• Turn Duration: ${formatTtfs(t.totalMs)}` : "",
               ].filter(Boolean);
+
+              const turnOutputCost = (outputRateM / 1000000) * t.output;
+              const turnCacheCost = (cacheReadRateM / 1000000) * t.cached;
+              const turnInputCost = (inputRateM / 1000000) * t.uncached;
 
               if (t.isAborted) {
                 ctx.ui.notify(
@@ -654,7 +707,7 @@ export default function (pi: ExtensionAPI) {
                   `• Tokens Sent: ${t.totalPrompt.toLocaleString()} tokens (sent to initialize cache)`,
                   `• Tokens Written to Cache: ${t.writeTokens.toLocaleString()}`,
                   `• Cached Tokens: ${t.cached.toLocaleString()}`,
-                  `• Output Generated: ${t.output.toLocaleString()}`,
+                  `• Output Generated: ${t.output.toLocaleString()} ($${turnOutputCost.toFixed(4)})`,
                   ...perfLines,
                   `• Turn Cost: $${t.cost.toFixed(4)}`,
                   `• Note: Initial session prefill & cache write. Excluded from cache miss count and miss cost.`,
@@ -664,10 +717,10 @@ export default function (pi: ExtensionAPI) {
                 const detail = [
                   `🔍 Turn 1 Details:`,
                   `• Verdict: 🔥 Warm Prefill Hit (Reused Prior Session Cache)`,
-                  `• Cached Tokens Reused: ${t.cached.toLocaleString()} (${t.hitPct.toFixed(1)}% cached)`,
-                  `• New Tokens Sent: ${t.uncached.toLocaleString()} (appended to cache)`,
+                  `• Cached Tokens Reused: ${t.cached.toLocaleString()} ($${turnCacheCost.toFixed(4)} · ${t.hitPct.toFixed(1)}% cached)`,
+                  `• New Tokens Sent: ${t.uncached.toLocaleString()} ($${turnInputCost.toFixed(4)})`,
                   `• Total Prompt: ${t.totalPrompt.toLocaleString()} tokens`,
-                  `• Output Generated: ${t.output.toLocaleString()}`,
+                  `• Output Generated: ${t.output.toLocaleString()} ($${turnOutputCost.toFixed(4)})`,
                   ...perfLines,
                   `• Turn Cost: $${t.cost.toFixed(4)} (discounted cache rate)`,
                   `• Note: Initial session prompt reused active cache from recent session within TTL.`,
@@ -688,11 +741,11 @@ export default function (pi: ExtensionAPI) {
                   `🔍 Turn ${t.turn} Details:`,
                   `• Verdict: ${verdict}`,
                   `• Turn Cost: $${t.cost.toFixed(4)}${costNote}`,
-                  `• Cached Tokens: ${t.cached.toLocaleString()}`,
-                  `• Uncached Input: ${t.uncached.toLocaleString()}`,
+                  `• Output Generated: ${t.output.toLocaleString()} tokens ($${turnOutputCost.toFixed(4)} @ $${outputRateM.toFixed(2)}/1M)`,
+                  `• Cached Prompt: ${t.cached.toLocaleString()} tokens ($${turnCacheCost.toFixed(4)} @ $${cacheReadRateM.toFixed(4)}/1M · ${t.hitPct.toFixed(1)}% cached)`,
+                  `• Uncached Input: ${t.uncached.toLocaleString()} tokens ($${turnInputCost.toFixed(4)} @ $${inputRateM.toFixed(2)}/1M)`,
                   t.writeTokens > 0 ? `• Cache Write: ${t.writeTokens.toLocaleString()} tokens` : "",
-                  `• Output Generated: ${t.output.toLocaleString()}`,
-                  `• Total Prompt: ${t.totalPrompt.toLocaleString()} (${t.hitPct.toFixed(1)}% cached)`,
+                  `• Total Prompt: ${t.totalPrompt.toLocaleString()}`,
                   ...perfLines,
                   !t.isHit ? `• Estimated overpay: ~$${t.overpay.toFixed(4)} vs a full hit (prior prefix re-sent uncached)` : "",
                 ].filter(Boolean).join("\n");
@@ -706,12 +759,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Fallback if select is unavailable or dismissed
-    const writeK = Math.round(totalWriteTokens / 1000);
-    const writeTitle = totalWriteTokens > 0 ? ` | Write: ${writeK}k [$${writeCost.toFixed(4)}]` : "";
-    ctx.ui?.notify?.(
-      `📊 Prompt Cache Breakdown (${overallRate}% overall | ${missBreakdown} | Total: $${totalCost.toFixed(4)}${writeTitle} | Overpaid ~$${overpay.toFixed(4)} | Miss turns: $${missCost.toFixed(4)}${avgTitle}):\n\n${options.join("\n")}`,
-      "info"
-    );
+    ctx.ui?.notify?.(sessionSummaryLines, "info");
   }
 
   // 1. Proactive affinity routing & provider-specific cache key handling

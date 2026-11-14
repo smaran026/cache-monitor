@@ -56,6 +56,9 @@ interface TurnDetail {
   isWarmPrefill: boolean;
   readK: number;
   readTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
   writeTokens: number;
   totalTokens: number;
   cost: number;
@@ -119,6 +122,8 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
           const input = d.tokens.input || 0;
           const read = d.tokens.cache?.read || 0;
           const explicitWrite = d.tokens.cache?.write || 0;
+          const output = d.tokens.output || 0;
+          const reasoning = d.tokens.reasoning || 0;
           const cost = typeof d.cost === "number" ? d.cost : 0;
           const total = input + read;
           const isCompleteHit = total > 0 && read >= total * completeHitFloor;
@@ -137,31 +142,33 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
           let description = "";
           let detail = "";
 
+          const outputStr = output + reasoning > 0 ? ` · ${(output + reasoning).toLocaleString()} out` : "";
+
           if (isColdPrefill) {
             turnWriteTokens = explicitWrite > 0 ? explicitWrite : input;
             label = `T1 Cold (${fmtK(total)}->${fmtK(turnWriteTokens)}W) ${shortCost}`;
             description = `warmup`;
-            detail = `Cold prefill: ${total.toLocaleString()} tokens sent, ${turnWriteTokens.toLocaleString()} written to cache (${costStr})`;
+            detail = `Cold prefill: ${total.toLocaleString()} tokens sent, ${turnWriteTokens.toLocaleString()} written to cache (${costStr}${outputStr})`;
           } else if (isWarmPrefill) {
             turnWriteTokens = explicitWrite > 0 ? explicitWrite : input;
             label = `T1 Warm (${fmtK(read)}+${fmtK(input)}) ${shortCost}`;
             description = `${pctStr}% cached`;
-            detail = `Warm prefill hit: ${read.toLocaleString()} cached + ${input.toLocaleString()} new tokens sent (${pctStr}% cached · ${costStr})`;
+            detail = `Warm prefill hit: ${read.toLocaleString()} cached + ${input.toLocaleString()} new tokens sent (${pctStr}% cached · ${costStr}${outputStr})`;
           } else if (isHit) {
             turnWriteTokens = explicitWrite;
             label = `T${turn} Hit (${fmtK(read)}) ${shortCost}`;
             description = `${pctStr}% (${fmtK(read)}/${fmtK(total)})`;
-            detail = `${pctStr}% cached (${read.toLocaleString()} / ${total.toLocaleString()} tokens · ${costStr})`;
+            detail = `${pctStr}% cached (${read.toLocaleString()} / ${total.toLocaleString()} tokens · ${costStr}${outputStr})`;
           } else if (isPartialMiss) {
             turnWriteTokens = explicitWrite;
             label = `T${turn} P Miss (${fmtK(read)}) ${shortCost}`;
             description = `${pctStr}% (${fmtK(read)}/${fmtK(total)})`;
-            detail = `Partial Miss (P Miss): ${pctStr}% cached (${read.toLocaleString()} / ${total.toLocaleString()} tokens · ${costStr})`;
+            detail = `Partial Miss (P Miss): ${pctStr}% cached (${read.toLocaleString()} / ${total.toLocaleString()} tokens · ${costStr}${outputStr})`;
           } else {
             turnWriteTokens = explicitWrite;
             label = `T${turn} Miss (${fmtK(read)}) ${shortCost}`;
             description = `${pctStr}% (${fmtK(read)}/${fmtK(total)})`;
-            detail = `Cache Miss: ${pctStr}% cached (${read.toLocaleString()} / ${total.toLocaleString()} tokens · turn cost ${costStr})`;
+            detail = `Cache Miss: ${pctStr}% cached (${read.toLocaleString()} / ${total.toLocaleString()} tokens · turn cost ${costStr}${outputStr})`;
           }
 
           turns.push({
@@ -172,6 +179,9 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
             isWarmPrefill,
             readK,
             readTokens: read,
+            inputTokens: input,
+            outputTokens: output,
+            reasoningTokens: reasoning,
             writeTokens: turnWriteTokens,
             totalTokens: total,
             cost,
@@ -211,9 +221,17 @@ async function openHistoryDialog(context: any, sessionID?: string) {
   let totalCost = 0;
   let missCost = 0;
   let writeTokens = 0;
+  let totalInput = 0;
+  let totalRead = 0;
+  let totalOutput = 0;
+  let totalReasoning = 0;
 
   for (const t of turns) {
     totalCost += t.cost;
+    totalInput += t.inputTokens;
+    totalRead += t.readTokens;
+    totalOutput += t.outputTokens;
+    totalReasoning += t.reasoningTokens;
     if (t.isColdPrefill) {
       writeTokens += t.writeTokens;
     } else if (t.isHit) {
@@ -231,11 +249,30 @@ async function openHistoryDialog(context: any, sessionID?: string) {
   const partialMisses = turns.filter((t) => t.isPartialMiss).length;
   const title = `Cache ${turns.length}t · $${totalCost.toFixed(2)}${writeStr} | ${fullMisses} miss · ${partialMisses} P | miss turns $${missCost.toFixed(2)} (${missPct}%)`;
 
-  const options = [...turns].reverse().map((t) => ({
-    title: t.label,
-    value: String(t.turn),
-    description: t.description,
-  }));
+  const validTurns = turns.filter((t) => t.turn > 1);
+  const turnAvgPct =
+    validTurns.length > 0
+      ? validTurns.reduce((s, t) => s + (t.totalTokens > 0 ? (t.readTokens / t.totalTokens) * 100 : 100), 0) /
+        validTurns.length
+      : 100;
+  const totalPrompt = totalInput + totalRead;
+  const tokenWeightedPct = totalPrompt > 0 ? (totalRead / totalPrompt) * 100 : 100;
+  const totalGen = totalOutput + totalReasoning;
+
+  const summaryOption = {
+    title: `📊 Session Cost & Token Breakdown (${turns.length} turns · $${totalCost.toFixed(3)})`,
+    value: "session_summary",
+    description: `Out/Reasoning: ${fmtK(totalGen)} | Read: ${fmtK(totalRead)} | New: ${fmtK(totalInput)}`,
+  };
+
+  const options = [
+    summaryOption,
+    ...[...turns].reverse().map((t) => ({
+      title: t.label,
+      value: String(t.turn),
+      description: t.description,
+    })),
+  ];
 
   dialogOpen = true;
   try {
@@ -246,11 +283,29 @@ async function openHistoryDialog(context: any, sessionID?: string) {
     }, 0);
     const chosen = await context.ui.dialog.select({
       title,
-      placeholder: "Filter (Miss, P Miss, Hit, Cold, T10)",
+      placeholder: "Filter (Summary, Miss, P Miss, Hit, Cold, T10)",
       options,
     });
     const pickedVal = typeof chosen === "string" ? chosen : chosen?.value;
     if (pickedVal && context.ui?.toast?.show) {
+      if (pickedVal === "session_summary") {
+        const reasoningPart = totalReasoning > 0 ? ` (incl. ${totalReasoning.toLocaleString()} reasoning)` : "";
+        context.ui.toast.show({
+          title: "Session Breakdown",
+          message: [
+            `Total Spend: $${totalCost.toFixed(4)} across ${turns.length} turns`,
+            `Cache Rate: ${turnAvgPct.toFixed(1)}% (turn avg) · ${tokenWeightedPct.toFixed(1)}% (token weighted)`,
+            `Output: ${totalGen.toLocaleString()} tokens${reasoningPart}`,
+            `Cache Read: ${totalRead.toLocaleString()} tokens`,
+            `Uncached Input: ${totalInput.toLocaleString()} tokens`,
+            writeTokens > 0 ? `Cache Write: ${writeTokens.toLocaleString()} tokens` : "",
+            `Misses: ${fullMisses} C Miss · ${partialMisses} P Miss`,
+          ].filter(Boolean).join("\n"),
+          variant: "info",
+          duration: 7000,
+        });
+        return;
+      }
       const t = turns.find((item) => String(item.turn) === String(pickedVal));
       if (t) {
         context.ui.toast.show({
