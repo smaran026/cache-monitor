@@ -947,6 +947,16 @@ interface HistoryNav {
   onBack?: () => Promise<void>;
 }
 
+interface SummaryModelCost {
+  providerID: string;
+  modelID: string;
+  cost: number;
+  costEstimated: boolean;
+  turns: number;
+  readTokens: number;
+  inputTokens: number;
+}
+
 async function openSummaryDialog(
   context: any,
   opts: {
@@ -955,6 +965,7 @@ async function openSummaryDialog(
     header: string;
     providerSummary: string;
     modelSummary: string;
+    modelCosts: SummaryModelCost[];
     agentSummary: string;
     turnsCount: number;
     totalCost: number;
@@ -974,6 +985,38 @@ async function openSummaryDialog(
   }
 ) {
   if (dialogOpen) return;
+  const multiModel = opts.modelCosts.length > 1;
+  const modelRows = multiModel
+    ? [
+        {
+          title: `Models   Multiple (${opts.modelCosts.length} models)`,
+          value: "__i2__",
+          description: fmtCost(opts.totalCost, opts.totalCostEstimated, 4),
+        },
+        ...opts.modelCosts.map((m, idx) => {
+          const mPrompt = m.inputTokens + m.readTokens;
+          const mRate = mPrompt > 0 ? ((m.readTokens / mPrompt) * 100).toFixed(0) : "100";
+          const mCost = fmtCost(m.cost, m.costEstimated, 4);
+          return {
+            title: `• ${truncPad(m.modelID || "unknown", 22)} ${padL(mCost, 8)}`,
+            value: `__im${idx}__`,
+            description: `${m.providerID || "?"} · ${m.turns}t · ${mRate}%`,
+          };
+        }),
+      ]
+    : [
+        {
+          title: `Provider ${opts.providerSummary}`,
+          value: "__i1__",
+          description: "",
+        },
+        {
+          title: `Model    ${opts.modelSummary}`,
+          value: "__i2__",
+          description: "",
+        },
+      ];
+
   const options = [
     {
       title: "← Back",
@@ -983,23 +1026,14 @@ async function openSummaryDialog(
     ...(opts.nav?.title
       ? [{ title: `Task     ${truncPad(opts.nav.title, 30).trim()}`, value: "__i0__", description: "" }]
       : []),
-    {
-      title: `Provider ${opts.providerSummary}`,
-      value: "__i1__",
-      description: "",
-    },
-    {
-      title: `Model    ${opts.modelSummary}`,
-      value: "__i2__",
-      description: "",
-    },
+    ...modelRows,
     {
       title: `Agent    ${opts.agentSummary}`,
       value: "__i2b__",
       description: "",
     },
     {
-      title: `Spend   ${fmtCost(opts.totalCost, opts.totalCostEstimated, 4)}`,
+      title: `Spend    ${fmtCost(opts.totalCost, opts.totalCostEstimated, 4)}`,
       value: "__i3__",
       description: `${opts.turnsCount} turns`,
     },
@@ -1216,7 +1250,6 @@ async function openHistoryDialog(
           },
         ]
       : []),
-    summaryOption,
     ...(hasSubagents && breakdown
       ? [
           {
@@ -1225,17 +1258,18 @@ async function openHistoryDialog(
             description: `${shortModel} · ${tokenWeightedPct.toFixed(0)}% cached · ${fullMisses}m`,
           },
           {
-            title: `• Agents & Models (${breakdown.byAgentModel.length})`,
-            value: "agent_breakdown",
-            description: `${fmtCost(breakdown.totals.cost, breakdown.totals.costEstimated, 2)} · ${breakdown.totals.turns}t`,
-          },
-          {
             title: `• Subagent Tasks (${childTasks.length})`,
             value: "task_list",
             description: `${fmtCost(childCost, childEst, 2)} · ${childTasks.reduce((s, t) => s + t.turns, 0)}t`,
           },
+          {
+            title: `• Agents & Models (${breakdown.byAgentModel.length})`,
+            value: "agent_breakdown",
+            description: `${fmtCost(breakdown.totals.cost, breakdown.totals.costEstimated, 2)} · ${breakdown.totals.turns}t`,
+          },
         ]
       : [
+          summaryOption,
           ...(hasMultiAgentOrTasks && breakdown
             ? [
                 {
@@ -1261,7 +1295,7 @@ async function openHistoryDialog(
     const chosen = await context.ui.dialog.select({
       title,
       placeholder: hasSubagents
-        ? "Filter (Summary, Main Agent, Agents, Tasks)"
+        ? "Filter (Main Agent, Subagent, Agents)"
         : "Filter (Summary, Miss, P Miss, Hit, T10)",
       options,
     });
@@ -1310,12 +1344,36 @@ async function openHistoryDialog(
     const uniqueProviders = [...new Set(turns.map((t) => t.providerID).filter(Boolean))];
     const uniqueModelIds = [...new Set(turns.map((t) => t.modelID).filter(Boolean))];
     const uniqueAgents = [...new Set(turns.map((t) => t.agent).filter(Boolean))];
+    const modelMap = new Map<string, SummaryModelCost>();
+    for (const t of turns) {
+      const k = `${t.providerID}\0${t.modelID}`;
+      let mc = modelMap.get(k);
+      if (!mc) {
+        mc = {
+          providerID: t.providerID,
+          modelID: t.modelID,
+          cost: 0,
+          costEstimated: false,
+          turns: 0,
+          readTokens: 0,
+          inputTokens: 0,
+        };
+        modelMap.set(k, mc);
+      }
+      mc.cost += t.cost;
+      if (t.costEstimated && t.cost > 0) mc.costEstimated = true;
+      mc.turns++;
+      mc.readTokens += t.readTokens;
+      mc.inputTokens += t.inputTokens;
+    }
+    const modelCosts = [...modelMap.values()].sort((a, b) => b.cost - a.cost || b.turns - a.turns);
     await openSummaryDialog(context, {
       sessionID: sid,
       nav,
       header: `Summary · ${nav?.title ? truncPad(nav.title, 28).trim() : `${turns.length}t`}`,
       providerSummary: uniqueProviders.length > 0 ? uniqueProviders.join(", ") : "unknown",
       modelSummary: uniqueModelIds.length > 0 ? uniqueModelIds.join(", ") : "unknown",
+      modelCosts,
       agentSummary: uniqueAgents.length > 0 ? uniqueAgents.join(", ") : nav?.agent || "default",
       turnsCount: turns.length,
       totalCost,
