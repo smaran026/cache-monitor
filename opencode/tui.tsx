@@ -1204,6 +1204,7 @@ async function openHistoryDialog(
   const childTasks = breakdown ? breakdown.byTask.filter((t) => t.depth > 0) : [];
   const childCost = childTasks.reduce((s, t) => s + t.cost, 0);
   const childEst = childTasks.some((t) => t.costEstimated && t.cost > 0);
+  const hasSubagents = !nav?.hideTreeLink && childTasks.length > 0 && breakdown !== null;
 
   const options = [
     ...(nav?.onBack
@@ -1216,44 +1217,59 @@ async function openHistoryDialog(
         ]
       : []),
     summaryOption,
-    ...(hasMultiAgentOrTasks && breakdown
+    ...(hasSubagents && breakdown
       ? [
+          {
+            title: `• Main Agent (${turns.length}t · ${fmtCost(totalCost, totalCostEstimated, 2)})`,
+            value: "main_agent",
+            description: `${shortModel} · ${tokenWeightedPct.toFixed(0)}% cached · ${fullMisses}m`,
+          },
           {
             title: `• Agents & Models (${breakdown.byAgentModel.length})`,
             value: "agent_breakdown",
             description: `${fmtCost(breakdown.totals.cost, breakdown.totals.costEstimated, 2)} · ${breakdown.totals.turns}t`,
           },
-          ...(childTasks.length > 0
+          {
+            title: `• Subagent Tasks (${childTasks.length})`,
+            value: "task_list",
+            description: `${fmtCost(childCost, childEst, 2)} · ${childTasks.reduce((s, t) => s + t.turns, 0)}t`,
+          },
+        ]
+      : [
+          ...(hasMultiAgentOrTasks && breakdown
             ? [
                 {
-                  title: `• Subagent Tasks (${childTasks.length})`,
-                  value: "task_list",
-                  description: `${fmtCost(childCost, childEst, 2)} · ${childTasks.reduce((s, t) => s + t.turns, 0)}t`,
+                  title: `• Agents & Models (${breakdown.byAgentModel.length})`,
+                  value: "agent_breakdown",
+                  description: `${fmtCost(breakdown.totals.cost, breakdown.totals.costEstimated, 2)} · ${breakdown.totals.turns}t`,
                 },
               ]
             : []),
-        ]
-      : []),
-    ...[...turns].reverse().map((t) => ({
-      title: t.label,
-      value: String(t.turn),
-      description: t.description,
-    })),
+          ...[...turns].reverse().map((t) => ({
+            title: t.label,
+            value: String(t.turn),
+            description: t.description,
+          })),
+        ]),
   ];
 
-  let nextAction: "back" | "breakdown" | "tasks" | "summary" | "turn" | null = null;
+  let nextAction: "back" | "main" | "breakdown" | "tasks" | "summary" | "turn" | null = null;
   let pickedTurn: TurnDetail | null = null;
   dialogOpen = true;
   try {
     setWideDialog(context);
     const chosen = await context.ui.dialog.select({
       title,
-      placeholder: "Filter (Summary, Agents, Tasks, Miss, P Miss, Hit, T10)",
+      placeholder: hasSubagents
+        ? "Filter (Summary, Main Agent, Agents, Tasks)"
+        : "Filter (Summary, Miss, P Miss, Hit, T10)",
       options,
     });
     const pickedVal = typeof chosen === "string" ? chosen : chosen?.value;
     if (pickedVal === "__back__" && nav?.onBack) {
       nextAction = "back";
+    } else if (pickedVal === "main_agent") {
+      nextAction = "main";
     } else if (pickedVal === "agent_breakdown" && breakdown) {
       nextAction = "breakdown";
     } else if (pickedVal === "task_list" && breakdown) {
@@ -1274,6 +1290,14 @@ async function openHistoryDialog(
 
   if (nextAction === "back" && nav?.onBack) {
     await nav.onBack();
+  } else if (nextAction === "main") {
+    await openHistoryDialog(context, sid, {
+      title: "Main Agent",
+      agent: turns[0]?.agent || "orchestrator",
+      hideTreeLink: true,
+      backLabel: "← Back to Session",
+      onBack: () => openHistoryDialog(context, sid),
+    });
   } else if (nextAction === "breakdown" && breakdown) {
     await openAgentBreakdownDialog(context, breakdown, sid);
   } else if (nextAction === "tasks" && breakdown) {
