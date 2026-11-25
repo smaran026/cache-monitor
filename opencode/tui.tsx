@@ -156,6 +156,7 @@ function resolveModelPricing(
       const chosen = peakNow ? (goEntry.peak ?? goEntry.offPeak) : (goEntry.offPeak ?? goEntry.peak);
       if (chosen) return { rate: chosen, tariff: peakNow ? "peak" : "off-peak" };
     }
+    if (goEntry?.base) return { rate: goEntry.base };
   }
 
   const models = loadModelsCache();
@@ -164,7 +165,7 @@ function resolveModelPricing(
   }
 
   // Custom OpenAI-compatible providers (e.g. opendesign) aren't in models.json;
-  // fall back to canonical provider entries for the same model id.
+  // fall back to canonical provider entries and go-limits.json for the same model id.
   if (!providerID || !models[providerID]) {
     const stripped = modelID.includes("/") ? modelID.split("/").pop()! : modelID;
     for (const pid of FALLBACK_PRICING_PROVIDERS) {
@@ -173,6 +174,9 @@ function resolveModelPricing(
       if (m[modelID]?.cost) return { rate: m[modelID].cost as ModelRate };
       if (m[stripped]?.cost) return { rate: m[stripped].cost as ModelRate };
     }
+    const goEntry = loadGoTariffs().get(normModelKey(stripped));
+    const goRate = goEntry?.base ?? goEntry?.offPeak ?? goEntry?.peak;
+    if (goRate) return { rate: goRate };
   }
   return { rate: null };
 }
