@@ -8,7 +8,10 @@ import { createSignal } from "solid-js";
 const DB_FILE = join(homedir(), ".local/share/opencode/opencode.db");
 const MODELS_CACHE_FILE = join(homedir(), ".cache/opencode/models.json");
 const GO_LIMITS_FILE = join(homedir(), ".cache/oc-models-pro/go-limits.json");
+const PRICING_CACHE_FILE = join(homedir(), ".cache/opencode/cache-monitor-pricing.json");
+const OPENCODE_CONFIG_FILE = join(homedir(), ".config/opencode/opencode.json");
 const CONFIG_FILE = join(homedir(), ".local/share/opencode/cache-monitor-config.json");
+const PRICING_REFRESH_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_P_MISS_PCT = 10;
 const DEFAULT_MISS_PCT = 50;
 
@@ -71,7 +74,8 @@ const FALLBACK_PRICING_PROVIDERS = [
 ];
 
 let modelsCache: { mtimeMs: number; data: Record<string, any> } | null = null;
-let goTariffCache: { mtimeMs: number; byKey: Map<string, { peak?: ModelRate; offPeak?: ModelRate; base?: ModelRate }> } | null = null;
+let pricingCache: { mtimeMs: number; data: { fetchedAt?: number; goLimits?: any[]; custom?: Record<string, Record<string, ModelRate>> } } | null = null;
+let goTariffCache: { sig: string; byKey: Map<string, { peak?: ModelRate; offPeak?: ModelRate; base?: ModelRate }> } | null = null;
 
 function normModelKey(name: string): string {
   return name
@@ -80,12 +84,155 @@ function normModelKey(name: string): string {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function loadPricingCache(): { fetchedAt?: number; goLimits?: any[]; custom?: Record<string, Record<string, ModelRate>> } {
+  try {
+    const st = statSync(PRICING_CACHE_FILE);
+    if (pricingCache && pricingCache.mtimeMs === st.mtimeMs) return pricingCache.data;
+    const data = JSON.parse(readFileSync(PRICING_CACHE_FILE, "utf8"));
+    if (data && typeof data === "object") {
+      pricingCache = { mtimeMs: st.mtimeMs, data };
+      return data;
+    }
+  } catch {}
+  return pricingCache?.data ?? {};
+}
+
+function stripHtmlText(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&gt;/g, ">")
+    .replace(/&lt;/g, "<")
+    .replace(/&#39;|&rsquo;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseCellMoney(html: string): number | undefined {
+  const plain = stripHtmlText(html);
+  if (/free/i.test(plain)) return 0;
+  const m = plain.match(/\$([\d.]+)/);
+  return m ? Number(m[1]) : undefined;
+}
+
+function parseGoPricingHtml(html: string): any[] {
+  const rows = html.split(/<tr[\s>]/i).slice(1);
+  const out: any[] = [];
+  const seen = new Set<string>();
+  for (const raw of rows) {
+    const row = raw.split(/<\/tr>/i)[0] ?? "";
+    const cells = row.match(/<td[^>]*>[\s\S]*?<\/td>/gi) ?? [];
+    if (cells.length < 5) continue;
+    const name = stripHtmlText(cells[0] ?? "");
+    if (!name || /^model$/i.test(name) || seen.has(name)) continue;
+    seen.add(name);
+    out.push({
+      name,
+      input: parseCellMoney(cells[1] ?? ""),
+      output: parseCellMoney(cells[2] ?? ""),
+      cacheRead: parseCellMoney(cells[3] ?? ""),
+      cacheWrite: parseCellMoney(cells[4] ?? ""),
+    });
+  }
+  return out;
+}
+
+function extractNumericModelRate(entry: any): ModelRate | null {
+  if (!entry || typeof entry !== "object") return null;
+  if (entry.cost && typeof entry.cost === "object" && typeof entry.cost.input === "number") {
+    return entry.cost as ModelRate;
+  }
+  const p = entry.pricing;
+  if (p && typeof p === "object") {
+    const toPerM = (v: unknown) => {
+      const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
+      return Number.isFinite(n) && n >= 0 ? n * 1_000_000 : undefined;
+    };
+    const input = toPerM(p.prompt ?? p.input);
+    const output = toPerM(p.completion ?? p.output);
+    if (input !== undefined || output !== undefined) {
+      return {
+        input,
+        output,
+        cache_read: toPerM(p.input_cache_read ?? p.cache_read),
+        cache_write: toPerM(p.input_cache_write ?? p.cache_write),
+      };
+    }
+  }
+  return null;
+}
+
+function resolveEnvTemplate(val: unknown): string {
+  if (typeof val !== "string") return "";
+  return val.replace(/\{env:([^}]+)\}/g, (_, name) => process.env[name] ?? "");
+}
+
+async function refreshPricingCache() {
+  try {
+    const existing = loadPricingCache();
+    if (existing.fetchedAt && Date.now() - existing.fetchedAt < PRICING_REFRESH_MS) return;
+
+    let goLimits = existing.goLimits;
+    try {
+      const res = await fetch("https://opencode.ai/docs/console/go/", { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const parsed = parseGoPricingHtml(await res.text());
+        if (parsed.length > 0) goLimits = parsed;
+      }
+    } catch {}
+
+    const custom: Record<string, Record<string, ModelRate>> = { ...(existing.custom ?? {}) };
+    try {
+      const ocCfg = JSON.parse(readFileSync(OPENCODE_CONFIG_FILE, "utf8"));
+      const providers = ocCfg?.provider ?? {};
+      for (const [pid, pcfg] of Object.entries<any>(providers)) {
+        const baseURL = typeof pcfg?.options?.baseURL === "string" ? pcfg.options.baseURL.replace(/\/+$/, "") : "";
+        if (!baseURL || pid === "ollama") continue;
+        const apiKey = resolveEnvTemplate(pcfg?.options?.apiKey);
+        const headers: Record<string, string> = {};
+        if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+        try {
+          const res = await fetch(`${baseURL}/models`, { headers, signal: AbortSignal.timeout(4000) });
+          if (!res.ok) continue;
+          const body: any = await res.json();
+          const list: any[] = Array.isArray(body?.data) ? body.data : [];
+          const rates: Record<string, ModelRate> = {};
+          for (const item of list) {
+            const rate = extractNumericModelRate(item);
+            if (rate && item?.id) rates[String(item.id)] = rate;
+          }
+          if (Object.keys(rates).length > 0) custom[pid] = rates;
+        } catch {}
+      }
+    } catch {}
+
+    mkdirSync(dirname(PRICING_CACHE_FILE), { recursive: true });
+    writeFileSync(PRICING_CACHE_FILE, JSON.stringify({ fetchedAt: Date.now(), goLimits, custom }));
+    pricingCache = null;
+    goTariffCache = null;
+  } catch {}
+}
+
 function loadGoTariffs(): Map<string, { peak?: ModelRate; offPeak?: ModelRate; base?: ModelRate }> {
   try {
-    const st = statSync(GO_LIMITS_FILE);
-    if (goTariffCache && goTariffCache.mtimeMs === st.mtimeMs) return goTariffCache.byKey;
-    const parsed = JSON.parse(readFileSync(GO_LIMITS_FILE, "utf8"));
-    const limits: any[] = parsed?.plan?.limits ?? [];
+    const cached = loadPricingCache();
+    let limits: any[] = [];
+    let sig = "";
+    if (Array.isArray(cached.goLimits) && cached.goLimits.length > 0) {
+      limits = cached.goLimits;
+      sig = `cache:${cached.fetchedAt ?? 0}`;
+    } else {
+      const st = statSync(GO_LIMITS_FILE);
+      sig = `file:${st.mtimeMs}`;
+      if (goTariffCache && goTariffCache.sig === sig) return goTariffCache.byKey;
+      const parsed = JSON.parse(readFileSync(GO_LIMITS_FILE, "utf8"));
+      limits = parsed?.plan?.limits ?? [];
+    }
+    if (goTariffCache && goTariffCache.sig === sig) return goTariffCache.byKey;
+
     const byKey = new Map<string, { peak?: ModelRate; offPeak?: ModelRate; base?: ModelRate }>();
     for (const row of limits) {
       if (!row?.name) continue;
@@ -102,7 +249,7 @@ function loadGoTariffs(): Map<string, { peak?: ModelRate; offPeak?: ModelRate; b
       else entry.base = rate;
       byKey.set(k, entry);
     }
-    goTariffCache = { mtimeMs: st.mtimeMs, byKey };
+    goTariffCache = { sig, byKey };
     return byKey;
   } catch {
     return goTariffCache?.byKey ?? new Map();
@@ -147,6 +294,9 @@ function resolveModelPricing(
   }
 
   if (providerID === "ollama" || modelID.endsWith("-free")) return { rate: null };
+
+  const liveCustom = providerID ? loadPricingCache().custom?.[providerID]?.[modelID] : undefined;
+  if (liveCustom) return { rate: liveCustom };
 
   // OpenCode Go models with Peak / Off-Peak tariffs (from go-limits.json)
   if (providerID === "opencode-go") {
@@ -1167,6 +1317,7 @@ async function openHistoryDialog(
 export default Plugin.define({
   id: "oc-mistral-affinity.tui",
   setup(context: any) {
+    void refreshPricingCache();
     const [tick, setTick] = createSignal(0);
     const timer = setInterval(() => {
       setTick((n) => n + 1);
