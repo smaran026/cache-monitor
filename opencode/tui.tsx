@@ -379,6 +379,19 @@ function fmtCost(cost: number, estimated: boolean, decimals: number): string {
   return `${prefix}$${cost.toFixed(decimals)}`;
 }
 
+function formatModelRates(providerID?: string, modelID?: string): { text: string; tariff?: "peak" | "off-peak" } | null {
+  const { rate, tariff } = resolveModelPricing(providerID, modelID, Date.now());
+  if (!rate) return null;
+  const fmtR = (v: number) => (v === 0 ? "$0" : v >= 0.01 ? `$${v.toFixed(2)}` : `$${v}`);
+  const parts: string[] = [];
+  if (rate.input !== undefined) parts.push(`I=${fmtR(rate.input)}`);
+  if (rate.output !== undefined) parts.push(`O=${fmtR(rate.output)}`);
+  if (rate.cache_read !== undefined) parts.push(`CR=${fmtR(rate.cache_read)}`);
+  if (rate.cache_write !== undefined) parts.push(`CW=${fmtR(rate.cache_write)}`);
+  if (parts.length === 0) return null;
+  return { text: parts.join(" "), tariff };
+}
+
 interface TurnDetail {
   turn: number;
   isHit: boolean;
@@ -737,6 +750,12 @@ async function openAgentDetailDialog(
       value: "__info_agent__",
       description: "",
     },
+    ...(() => {
+      const r = formatModelRates(group.providerID, group.modelID);
+      return r
+        ? [{ title: `Rates    ${r.text}`, value: "__info_rates__", description: r.tariff ? `/1M (${r.tariff})` : "/1M" }]
+        : [];
+    })(),
     {
       title: `Spend    ${costStr}`,
       value: "__info_spend__",
@@ -1015,6 +1034,13 @@ async function openSummaryDialog(
           value: "__i2__",
           description: "",
         },
+        ...(() => {
+          const m = opts.modelCosts[0];
+          const r = m ? formatModelRates(m.providerID, m.modelID) : null;
+          return r
+            ? [{ title: `Rates    ${r.text}`, value: "__i2r__", description: r.tariff ? `/1M (${r.tariff})` : "/1M" }]
+            : [];
+        })(),
       ];
 
   const options = [
@@ -1207,13 +1233,15 @@ async function openHistoryDialog(
   const writeStr = writeTokens > 0 ? ` | W:${writeK}k` : "";
   const fullMisses = turns.filter((t) => !t.isColdPrefill && !t.isHit && !t.isPartialMiss).length;
   const partialMisses = turns.filter((t) => t.isPartialMiss).length;
+  const hits = turns.filter((t) => t.isHit).length;
   const treeNote =
     breakdown && breakdown.totals.childCount > 0
       ? ` (tree ${breakdown.totals.turns}t · ${fmtCost(breakdown.totals.cost, breakdown.totals.costEstimated, 2)})`
       : "";
-  const title = nav?.title
-    ? `${nav.agent ? `[${nav.agent}] ` : ""}${truncPad(nav.title, 26).trim()} · ${turns.length}t · ${fmtCost(totalCost, totalCostEstimated, 2)} | ${fullMisses}m · ${partialMisses}P`
-    : `Cache ${turns.length}t · ${fmtCost(totalCost, totalCostEstimated, 2)}${treeNote}${writeStr} | ${fullMisses} miss · ${partialMisses} P | miss ${fmtCost(missCost, missCostEstimated, 2)} (${missPct}%)`;
+  const prefix = nav?.title
+    ? `${nav.agent ? `[${nav.agent}] ` : ""}${truncPad(nav.title, 20).trim()}`
+    : "Cache";
+  const title = `${prefix} ${turns.length}t · ${fmtCost(totalCost, totalCostEstimated, 2)}${treeNote}${writeStr} | ${hits} hit · ${fullMisses} C miss · ${partialMisses} P miss | miss ${fmtCost(missCost, missCostEstimated, 2)} (${missPct}%)`;
 
   const validTurns = turns.filter((t) => t.turn > 1);
   const turnAvgPct =
