@@ -356,22 +356,20 @@ function estimateTurnCost(
   providerID?: string,
   modelID?: string,
   timestampMs?: number
-): { cost: number; tariff?: "peak" | "off-peak" } {
+): { cost: number; inputCost: number; readCost: number; writeCost: number; outputCost: number; tariff?: "peak" | "off-peak" } {
   const { rate: base, tariff } = resolveModelPricing(providerID, modelID, timestampMs);
-  if (!base) return { cost: 0 };
+  if (!base) return { cost: 0, inputCost: 0, readCost: 0, writeCost: 0, outputCost: 0 };
   const input = tokens.input || 0;
   const read = tokens.cache?.read || 0;
   const write = tokens.cache?.write || 0;
   const output = tokens.output || 0;
   const reasoning = tokens.reasoning || 0;
   const rates = selectRateTier(base, input + read + write);
-  const total =
-    input * (rates.input ?? 0) +
-    read * (rates.cache_read ?? 0) +
-    write * (rates.cache_write ?? rates.input ?? 0) +
-    output * (rates.output ?? 0) +
-    reasoning * (rates.reasoning ?? rates.output ?? 0);
-  return { cost: total / 1_000_000, tariff };
+  const inputCost = (input * (rates.input ?? 0)) / 1_000_000;
+  const readCost = (read * (rates.cache_read ?? 0)) / 1_000_000;
+  const writeCost = (write * (rates.cache_write ?? rates.input ?? 0)) / 1_000_000;
+  const outputCost = (output * (rates.output ?? 0) + reasoning * (rates.reasoning ?? rates.output ?? 0)) / 1_000_000;
+  return { cost: inputCost + readCost + writeCost + outputCost, inputCost, readCost, writeCost, outputCost, tariff };
 }
 
 function fmtCost(cost: number, estimated: boolean, decimals: number): string {
@@ -406,6 +404,10 @@ interface TurnDetail {
   writeTokens: number;
   totalTokens: number;
   cost: number;
+  inputCost: number;
+  readCost: number;
+  writeCost: number;
+  outputCost: number;
   costEstimated: boolean;
   agent: string;
   providerID: string;
@@ -478,8 +480,13 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
           const modelID = d.model?.id || d.modelID || "";
           const msgTs = typeof d.time?.created === "number" ? d.time.created : r.time_created;
           const costEstimated = !(rawCost > 0);
-          const est = rawCost > 0 ? { cost: rawCost, tariff: undefined } : estimateTurnCost(d.tokens, providerID, modelID, msgTs);
-          const cost = est.cost;
+          const est = estimateTurnCost(d.tokens, providerID, modelID, msgTs);
+          const cost = rawCost > 0 ? rawCost : est.cost;
+          const scale = rawCost > 0 && est.cost > 0 ? rawCost / est.cost : 1;
+          const inputCost = est.inputCost * scale;
+          const readCost = est.readCost * scale;
+          const writeCost = est.writeCost * scale;
+          const outputCost = est.outputCost * scale;
           const total = input + read;
           const isCompleteHit = total > 0 && read >= total * completeHitFloor;
           const isStrictHit = total > 0 && read >= total * strictHitFloor;
@@ -543,6 +550,10 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
             writeTokens: turnWriteTokens,
             totalTokens: total,
             cost,
+            inputCost,
+            readCost,
+            writeCost,
+            outputCost,
             costEstimated,
             agent,
             providerID,
@@ -998,6 +1009,10 @@ async function openSummaryDialog(
     totalGen: number;
     totalReasoning: number;
     writeTokens: number;
+    totalReadCost: number;
+    totalInputCost: number;
+    totalOutputCost: number;
+    totalWriteCost: number;
     fullMisses: number;
     partialMisses: number;
     treeLine: string;
@@ -1079,20 +1094,26 @@ async function openSummaryDialog(
     {
       title: `Read    ${opts.totalRead.toLocaleString()}`,
       value: "__i7__",
-      description: "cached input tokens",
+      description: `${fmtCost(opts.totalReadCost, opts.totalCostEstimated, 4)} · cached`,
     },
     {
       title: `New In  ${opts.totalInput.toLocaleString()}`,
       value: "__i8__",
-      description: "uncached input tokens",
+      description: `${fmtCost(opts.totalInputCost, opts.totalCostEstimated, 4)} · uncached`,
     },
     {
       title: `Output  ${opts.totalGen.toLocaleString()}`,
       value: "__i9__",
-      description: opts.totalReasoning > 0 ? `incl. ${opts.totalReasoning.toLocaleString()} reasoning` : "output tokens",
+      description: `${fmtCost(opts.totalOutputCost, opts.totalCostEstimated, 4)}${opts.totalReasoning > 0 ? ` · ${opts.totalReasoning.toLocaleString()} reason` : ""}`,
     },
     ...(opts.writeTokens > 0
-      ? [{ title: `Write   ${opts.writeTokens.toLocaleString()}`, value: "__i10__", description: "cache write tokens" }]
+      ? [
+          {
+            title: `Write   ${opts.writeTokens.toLocaleString()}`,
+            value: "__i10__",
+            description: `${fmtCost(opts.totalWriteCost, opts.totalCostEstimated, 4)} · cache write`,
+          },
+        ]
       : []),
   ];
 
@@ -1146,10 +1167,10 @@ async function openTurnDetailDialog(
     { title: `Model    ${t.modelID || "unknown"}`, value: "__i2b__", description: "" },
     { title: `Agent    ${t.agent}`, value: "__i2c__", description: "" },
     { title: `Cost     ${fmtCost(t.cost, t.costEstimated, 4)}`, value: "__i3__", description: t.costEstimated ? "estimated" : "reported" },
-    { title: `Read     ${t.readTokens.toLocaleString()}`, value: "__i4__", description: "cached tokens" },
-    { title: `New In   ${t.inputTokens.toLocaleString()}`, value: "__i5__", description: "uncached tokens" },
-    { title: `Output   ${(t.outputTokens + t.reasoningTokens).toLocaleString()}`, value: "__i6__", description: t.reasoningTokens > 0 ? `incl. ${t.reasoningTokens.toLocaleString()} reasoning` : "" },
-    ...(t.writeTokens > 0 ? [{ title: `Write    ${t.writeTokens.toLocaleString()}`, value: "__i7__", description: "cache write" }] : []),
+    { title: `Read     ${t.readTokens.toLocaleString()}`, value: "__i4__", description: `${fmtCost(t.readCost, t.costEstimated, 4)} · cached` },
+    { title: `New In   ${t.inputTokens.toLocaleString()}`, value: "__i5__", description: `${fmtCost(t.inputCost, t.costEstimated, 4)} · uncached` },
+    { title: `Output   ${(t.outputTokens + t.reasoningTokens).toLocaleString()}`, value: "__i6__", description: `${fmtCost(t.outputCost, t.costEstimated, 4)}${t.reasoningTokens > 0 ? ` · ${t.reasoningTokens.toLocaleString()} reason` : ""}` },
+    ...(t.writeTokens > 0 ? [{ title: `Write    ${t.writeTokens.toLocaleString()}`, value: "__i7__", description: `${fmtCost(t.writeCost, t.costEstimated, 4)} · cache write` }] : []),
   ];
 
   let action: "back" | "stay" | null = null;
@@ -1415,6 +1436,10 @@ async function openHistoryDialog(
       totalGen,
       totalReasoning,
       writeTokens,
+      totalReadCost: turns.reduce((s, t) => s + t.readCost, 0),
+      totalInputCost: turns.reduce((s, t) => s + t.inputCost, 0),
+      totalOutputCost: turns.reduce((s, t) => s + t.outputCost, 0),
+      totalWriteCost: turns.reduce((s, t) => s + t.writeCost, 0),
       fullMisses,
       partialMisses,
       treeLine,
