@@ -168,15 +168,20 @@ function resolveModelPricing(
   // fall back to canonical provider entries and go-limits.json for the same model id.
   if (!providerID || !models[providerID]) {
     const stripped = modelID.includes("/") ? modelID.split("/").pop()! : modelID;
-    for (const pid of FALLBACK_PRICING_PROVIDERS) {
-      const m = models[pid]?.models;
-      if (!m) continue;
-      if (m[modelID]?.cost) return { rate: m[modelID].cost as ModelRate };
-      if (m[stripped]?.cost) return { rate: m[stripped].cost as ModelRate };
+    const baseVariant = stripped
+      .replace(/-(?:eco|thinking|reasoning|high|medium|low|fast)$/i, "")
+      .replace(/flashx$/i, "flash");
+    const candidates = stripped === baseVariant ? [modelID, stripped] : [modelID, stripped, baseVariant];
+
+    for (const cand of candidates) {
+      for (const pid of FALLBACK_PRICING_PROVIDERS) {
+        const m = models[pid]?.models;
+        if (m?.[cand]?.cost) return { rate: m[cand].cost as ModelRate };
+      }
+      const goEntry = loadGoTariffs().get(normModelKey(cand));
+      const goRate = goEntry?.base ?? goEntry?.offPeak ?? goEntry?.peak;
+      if (goRate) return { rate: goRate };
     }
-    const goEntry = loadGoTariffs().get(normModelKey(stripped));
-    const goRate = goEntry?.base ?? goEntry?.offPeak ?? goEntry?.peak;
-    if (goRate) return { rate: goRate };
   }
   return { rate: null };
 }
