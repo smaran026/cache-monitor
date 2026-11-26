@@ -418,6 +418,7 @@ interface TurnDetail {
   writeTokens: number;
   totalTokens: number;
   cost: number;
+  apiCost: number;
   inputCost: number;
   readCost: number;
   writeCost: number;
@@ -493,9 +494,11 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
           const providerID = d.model?.providerID || d.providerID || "";
           const modelID = d.model?.id || d.modelID || "";
           const msgTs = typeof d.time?.created === "number" ? d.time.created : r.time_created;
-          const costEstimated = !(rawCost > 0);
+          const isClaudeSub = providerID === "claude-agent" && rawCost === 0;
+          const costEstimated = !isClaudeSub && !(rawCost > 0);
           const est = estimateTurnCost(d.tokens, providerID, modelID, msgTs);
-          const cost = rawCost > 0 ? rawCost : est.cost;
+          const cost = rawCost > 0 ? rawCost : isClaudeSub ? 0 : est.cost;
+          const apiCost = rawCost > 0 ? rawCost : est.cost;
           const scale = rawCost > 0 && est.cost > 0 ? rawCost / est.cost : 1;
           const inputCost = est.inputCost * scale;
           const readCost = est.readCost * scale;
@@ -564,6 +567,7 @@ function getSessionTurnHistory(sessionID?: string): TurnDetail[] {
             writeTokens: turnWriteTokens,
             totalTokens: total,
             cost,
+            apiCost,
             inputCost,
             readCost,
             writeCost,
@@ -595,6 +599,7 @@ interface AggregateStats {
   reasoningTokens: number;
   writeTokens: number;
   cost: number;
+  apiCost: number;
   costEstimated: boolean;
   fullMisses: number;
   partialMisses: number;
@@ -630,6 +635,7 @@ function emptyStats(): AggregateStats {
     reasoningTokens: 0,
     writeTokens: 0,
     cost: 0,
+    apiCost: 0,
     costEstimated: false,
     fullMisses: 0,
     partialMisses: 0,
@@ -644,6 +650,7 @@ function addTurnToStats(stats: AggregateStats, t: TurnDetail) {
   stats.reasoningTokens += t.reasoningTokens;
   stats.writeTokens += t.writeTokens;
   stats.cost += t.cost;
+  stats.apiCost += t.apiCost;
   if (t.costEstimated && t.cost > 0) stats.costEstimated = true;
   if (t.isPartialMiss) stats.partialMisses++;
   else if (!t.isColdPrefill && !t.isHit) stats.fullMisses++;
@@ -784,8 +791,17 @@ async function openAgentDetailDialog(
     {
       title: `Spend    ${costStr}`,
       value: "__info_spend__",
-      description: `${group.turns} turns`,
+      description: `${group.turns} turns${group.providerID === "claude-agent" ? " · subscription" : ""}`,
     },
+    ...(group.providerID === "claude-agent" && group.apiCost > 0
+      ? [
+          {
+            title: `API Eq   ~${fmtCost(group.apiCost, false, 4)}`,
+            value: "__info_apieq__",
+            description: "claude subscription equiv.",
+          },
+        ]
+      : []),
     {
       title: `Cache    ${rate}%`,
       value: "__info_cache__",
@@ -1014,6 +1030,7 @@ async function openSummaryDialog(
     turnsCount: number;
     totalCost: number;
     totalCostEstimated: boolean;
+    claudeApiCost: number;
     missCost: number;
     missCostEstimated: boolean;
     turnAvgPct: number;
@@ -1092,6 +1109,15 @@ async function openSummaryDialog(
       value: "__i3__",
       description: `${opts.turnsCount} turns`,
     },
+    ...(opts.claudeApiCost > 0
+      ? [
+          {
+            title: `API Eq   ~${fmtCost(opts.claudeApiCost, false, 4)}`,
+            value: "__i3b__",
+            description: "claude subscription equiv.",
+          },
+        ]
+      : []),
     ...(opts.treeLine
       ? [{ title: `Tree    ${opts.treeLine}`, value: "__i4__", description: "" }]
       : []),
@@ -1108,24 +1134,24 @@ async function openSummaryDialog(
     {
       title: `Read    ${opts.totalRead.toLocaleString()}`,
       value: "__i7__",
-      description: `${fmtCost(opts.totalReadCost, opts.totalCostEstimated, 4)} · cached`,
+      description: `${fmtCost(opts.totalReadCost, opts.totalCostEstimated || opts.claudeApiCost > 0, 4)} · cached`,
     },
     {
       title: `New In  ${opts.totalInput.toLocaleString()}`,
       value: "__i8__",
-      description: `${fmtCost(opts.totalInputCost, opts.totalCostEstimated, 4)} · uncached`,
+      description: `${fmtCost(opts.totalInputCost, opts.totalCostEstimated || opts.claudeApiCost > 0, 4)} · uncached`,
     },
     {
       title: `Output  ${opts.totalGen.toLocaleString()}`,
       value: "__i9__",
-      description: `${fmtCost(opts.totalOutputCost, opts.totalCostEstimated, 4)}${opts.totalReasoning > 0 ? ` · ${opts.totalReasoning.toLocaleString()} reason` : ""}`,
+      description: `${fmtCost(opts.totalOutputCost, opts.totalCostEstimated || opts.claudeApiCost > 0, 4)}${opts.totalReasoning > 0 ? ` · ${opts.totalReasoning.toLocaleString()} reason` : ""}`,
     },
     ...(opts.writeTokens > 0
       ? [
           {
             title: `Write   ${opts.writeTokens.toLocaleString()}`,
             value: "__i10__",
-            description: `${fmtCost(opts.totalWriteCost, opts.totalCostEstimated, 4)} · cache write`,
+            description: `${fmtCost(opts.totalWriteCost, opts.totalCostEstimated || opts.claudeApiCost > 0, 4)} · cache write`,
           },
         ]
       : []),
@@ -1441,6 +1467,7 @@ async function openHistoryDialog(
       turnsCount: turns.length,
       totalCost,
       totalCostEstimated,
+      claudeApiCost: turns.reduce((s, t) => s + (t.providerID === "claude-agent" ? t.apiCost : 0), 0),
       missCost,
       missCostEstimated,
       turnAvgPct,
