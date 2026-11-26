@@ -73,6 +73,13 @@ const FALLBACK_PRICING_PROVIDERS = [
   "google",
 ];
 
+const MODEL_ALIASES: Record<string, string> = {
+  sonnet: "claude-sonnet-4-6",
+  opus: "claude-opus-4-6",
+  haiku: "claude-haiku-4-5",
+  fable: "claude-fable-5-1",
+};
+
 let modelsCache: { mtimeMs: number; data: Record<string, any> } | null = null;
 let pricingCache: { mtimeMs: number; data: { fetchedAt?: number; goLimits?: any[]; custom?: Record<string, Record<string, ModelRate>> } } | null = null;
 let goTariffCache: { sig: string; byKey: Map<string, { peak?: ModelRate; offPeak?: ModelRate; base?: ModelRate }> } | null = null;
@@ -320,14 +327,15 @@ function resolveModelPricing(
     return { rate: models[providerID].models[modelID].cost as ModelRate };
   }
 
-  // Custom OpenAI-compatible providers (e.g. opendesign) aren't in models.json;
+  // Custom OpenAI-compatible or agent providers (e.g. opendesign, claude-agent) aren't in models.json;
   // fall back to canonical provider entries and go-limits.json for the same model id.
   if (!providerID || !models[providerID]) {
     const stripped = modelID.includes("/") ? modelID.split("/").pop()! : modelID;
+    const aliased = MODEL_ALIASES[stripped.toLowerCase()];
     const baseVariant = stripped
       .replace(/-(?:eco|thinking|reasoning|high|medium|low|fast)$/i, "")
       .replace(/flashx$/i, "flash");
-    const candidates = stripped === baseVariant ? [modelID, stripped] : [modelID, stripped, baseVariant];
+    const candidates = [...new Set([modelID, stripped, baseVariant, ...(aliased ? [aliased] : [])])];
 
     for (const cand of candidates) {
       for (const pid of FALLBACK_PRICING_PROVIDERS) {
