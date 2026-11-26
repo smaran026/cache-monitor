@@ -180,7 +180,9 @@ async function refreshPricingCache() {
       const res = await fetch("https://opencode.ai/docs/console/go/", { signal: AbortSignal.timeout(5000) });
       if (res.ok) {
         const parsed = parseGoPricingHtml(await res.text());
-        if (parsed.length > 0) goLimits = parsed;
+        if (parsed.length >= 10 && parsed.some((r) => typeof r.input === "number")) {
+          goLimits = parsed;
+        }
       }
     } catch {}
 
@@ -219,19 +221,23 @@ async function refreshPricingCache() {
 function loadGoTariffs(): Map<string, { peak?: ModelRate; offPeak?: ModelRate; base?: ModelRate }> {
   try {
     const cached = loadPricingCache();
-    let limits: any[] = [];
-    let sig = "";
-    if (Array.isArray(cached.goLimits) && cached.goLimits.length > 0) {
-      limits = cached.goLimits;
-      sig = `cache:${cached.fetchedAt ?? 0}`;
-    } else {
-      const st = statSync(GO_LIMITS_FILE);
-      sig = `file:${st.mtimeMs}`;
-      if (goTariffCache && goTariffCache.sig === sig) return goTariffCache.byKey;
-      const parsed = JSON.parse(readFileSync(GO_LIMITS_FILE, "utf8"));
-      limits = parsed?.plan?.limits ?? [];
-    }
+    let fileMtime = 0;
+    let fileLimits: any[] = [];
+    try {
+      fileMtime = statSync(GO_LIMITS_FILE).mtimeMs;
+      fileLimits = JSON.parse(readFileSync(GO_LIMITS_FILE, "utf8"))?.plan?.limits ?? [];
+    } catch {}
+
+    const cachedLimits =
+      Array.isArray(cached.goLimits) &&
+      cached.goLimits.length >= 10 &&
+      cached.goLimits.some((r) => typeof r?.input === "number")
+        ? cached.goLimits
+        : [];
+    const sig = `file:${fileMtime}:cache:${cachedLimits.length > 0 ? cached.fetchedAt ?? 0 : 0}`;
     if (goTariffCache && goTariffCache.sig === sig) return goTariffCache.byKey;
+
+    const limits = [...fileLimits, ...cachedLimits];
 
     const byKey = new Map<string, { peak?: ModelRate; offPeak?: ModelRate; base?: ModelRate }>();
     for (const row of limits) {
